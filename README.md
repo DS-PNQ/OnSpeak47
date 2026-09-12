@@ -4,6 +4,10 @@
 
 Edge AI Challenge, Phase 2 | Public Services domain | Android-first, wearable-ready
 
+> Snapshot: this README describes the project state **before VAD auto-listen
+> was added** — input is push-to-talk only, with a post-record RMS silence
+> gate. Translation runs on the Hy-MT1.5 GGUF path below.
+
 ---
 
 ## Pipeline
@@ -11,7 +15,7 @@ Edge AI Challenge, Phase 2 | Public Services domain | Android-first, wearable-re
 ```
 [User speaks]
     → Whisper Small — transcribes speech to text
-    → NLLB-200 Distilled 600M — translates text between VN/EN/CN
+    → Hy-MT1.5-1.8B-1.25bit GGUF — translates text between VN/EN/CN
     → MMS-TTS — converts translated text back to speech
 [Translated speech plays]
 ```
@@ -25,24 +29,31 @@ End-to-end ASR on ~3 s clips measured **~10× faster** (en 5515→533 ms,
 vi 5160→570 ms, desktop ort 1.22) with quality equal or better — see
 `docs/optimization_results.md`.
 
+**Translation runs on a single GGUF backend**: Tencent Hy-MT1.5-1.8B quantized
+to 1.25-bit STQ (Sherry, 440 MB), decoded on the mobile CPU by llama.cpp +
+the STQ kernel (llama.cpp PR #22836). Same base model as RTranslator v3
+(`tencent/HY-MT1.5-1.8B`), different deployment (GGUF/llama.cpp vs INT8
+ONNX/ORT). Decode is **greedy** (deterministic MT, no sampling cost), stops on
+the real end-of-assistant token (`120020`), and short ASR transcripts take a
+**single LLM call** (one prefill) with a 64–128 token budget.
+
 ## Project Structure
 
 ```
 OnSpeak47/
 ├── backend/                    # Python pipeline modules
 │   ├── asr_whisper.py         # Whisper Small ASR wrapper
-│   ├── translation_nllb.py    # NLLB-200 translation (batch, pivot, corpus)
+│   ├── translation_hymt.py    # Hy-MT1.5 translation (greedy, single-call)
 │   ├── tts_mms.py             # MMS-TTS speech synthesis
 │   └── orchestrator.py        # ASR → Translation → TTS pipeline
 │
 ├── tests_local/               # Local quality tests (no device needed)
 │   ├── conftest.py            # Fixtures for all test modules
 │   ├── test_01_asr.py         # Whisper transcription accuracy
-│   ├── test_02_translation.py # NLLB BLEU scoring (parallel sentences)
-│   ├── test_03_tts.py         # MMS-TTS synthesis validation
-│   ├── test_04_vizh_corpus.py # Large-corpus VI↔ZH BLEU evaluation
+│   ├── test_02_translation.py # Hy-MT translation scoring
+│   ├── test_04_vizh_corpus.py # Large-corpus VI↔ZH evaluation
 │   ├── test_05_pipeline.py    # End-to-end pipeline tests
-│   ├── test_06_onnx_parity.py # ONNX parity GATE — quality vs PyTorch + regression baseline
+│   ├── test_06_onnx_parity.py # ONNX parity GATE (Whisper assets)
 │   ├── gen_parity_reference.py     # Generates the PyTorch greedy reference
 │   ├── verify_preprocess_onnx.py   # whisper_preprocess.onnx sanity check
 │   ├── diagnose_whisper_paths.py   # Decodes two fixtures on every asset variant
@@ -52,16 +63,13 @@ OnSpeak47/
 │       ├── parallel_sentences.json     # 40 hand-curated test sentences
 │       └── audio_samples/              # ASR parity fixtures (WAV + reference text)
 │
-├── optimize/                  # ONNX export & mobile optimization
-│   ├── 01_export_onnx.py     # Export all models to ONNX (original pipeline)
-│   ├── 02_prune_vocab.py     # Prune NLLB vocabulary to VN/EN/CN
-│   ├── 03_quantize_aimet.py  # INT8 quantization (generic + AIMET)
-│   ├── 04_qah_submit.py     # Qualcomm AI Hub submission
-│   ├── 05_slim_decoder.py   # Slim NLLB decoder (drop fp32 embedding)
-│   ├── 06_quantize_whisper.py       # Legacy: quantize the cache-less decoder export
-│   ├── 07_preoptimize.py     # Offline ORT graph pre-opt (*.opt.onnx) — run in ort==1.22 venv
-│   ├── 08_quantize_whisper_encoder.py  # Legacy: int8 the fixed-3000 encoder export
-│   ├── 09_export_whisper_decoder_kv.py # KV-cached Whisper decoder (CURRENT — streaming ASR)
+├── optimize/                  # Model asset preparation
+│   ├── 07_prepare_hymt_gguf.py       # Fetch Hy-MT 1.25-bit GGUF + typefix
+│   ├── 08_export_hymt_onnx_int4.py   # Reference: INT4 ONNX export (ORT GenAI)
+│   ├── hymt_gguf_typefix.py          # Remap legacy STQ tensor-type codes
+│   ├── 01_export_onnx.py     # Whisper ONNX export
+│   ├── 07_preoptimize.py     # Offline ORT graph pre-opt (*.opt.onnx)
+│   ├── 09_export_whisper_decoder_kv.py # KV-cached Whisper decoder (CURRENT)
 │   ├── 10_export_whisper_encoder_dyn.py # Dynamic-length Whisper encoder (CURRENT)
 │   └── export_mms_tts.py     # MMS-TTS export
 │
@@ -70,10 +78,12 @@ OnSpeak47/
 │   │   ├── java/com/omnivoice/onspeak47/
 │   │   │   ├── OmniVoiceApp.java
 │   │   │   ├── LoadingActivity.java
-│   │   │   ├── TranslationActivity.java
-│   │   │   ├── pipeline/     # ASR, Translation, TTS, PipelineOrchestrator, Tokenizer
-│   │   │   ├── audio/        # AudioRecorder, AudioPlayer
-│   │   │   └── util/         # LanguageConfig, OrtSessionConfig, TensorUtils, FileUtils
+│   │   │   ├── TranslationActivity.java   # Push-to-talk UI + RMS silence gate
+│   │   │   ├── pipeline/     # ASR, Translation (GGUF), HyMtGgufJNI bridge,
+│   │   │   │                 # TTS, PipelineOrchestrator, Tokenizer
+│   │   │   ├── audio/        # AudioRecorder (manual record), AudioPlayer
+│   │   │   └── util/         # LanguageConfig, OrtSessionConfig, TensorUtils
+│   │   ├── cpp/              # hymt_gguf_jni.cpp + CMakeLists (vendored llama.cpp)
 │   │   └── res/              # Layouts, values, raw language XMLs
 │   └── build.gradle
 │
@@ -103,7 +113,7 @@ python -c "import torch, transformers, sentencepiece, soundfile, librosa, scipy,
 
 ## Running Tests
 
-### Translation quality (NLLB BLEU)
+### Translation quality (Hy-MT)
 ```powershell
 python -m pytest tests_local/test_02_translation.py -v
 ```
@@ -123,11 +133,9 @@ python -m pytest tests_local/test_05_pipeline.py -v -s
 python -m pytest tests_local/ -v -s
 ```
 
-### ONNX parity GATE (required after ANY model/asset change)
-Runs the exact on-device inference scheme (ORT + KV-cached greedy decode,
-mirroring the Java modules) against the bundled assets and compares against
-the PyTorch greedy reference plus a recorded regression baseline. Use a
-python with **onnxruntime==1.22.0** (the version the app ships):
+### ONNX parity GATE (Whisper assets)
+Runs the exact on-device inference scheme against the bundled assets.
+Use a python with **onnxruntime==1.22.0** (the version the app ships):
 
 ```powershell
 python -m venv .venv-ort122
@@ -135,151 +143,109 @@ python -m venv .venv-ort122
 .venv-ort122\Scripts\python -m pytest tests_local\test_06_onnx_parity.py -v
 ```
 
-8/8 must pass (6 NLLB directions + Whisper en/vi). Latest recorded run:
-`tests_local/output/onnx_parity_results.json`.
+## Translation Backend (Hy-MT1.5-1.8B-1.25bit)
 
-## ONNX Export
+Both the Python backend (`backend/translation_hymt.py`) and the Android app
+(`pipeline/TranslationModule.java` + `cpp/hymt_gguf_jni.cpp`) share one design,
+tuned against RTranslator v3's HY-MT ONNX path:
 
-`*.onnx` files are **gitignored** — a fresh checkout must regenerate the
-assets before building the app (see "Required assets" for the exact list).
+- **Greedy decode everywhere** — `temperature=0/top_k=1` (Python),
+  `llama_sampler_init_greedy()` (JNI). The HY-MT report sampling values
+  (`top_k=20/top_p=0.6/temp=0.7`) are reference-only; sampling adds RNG cost
+  and longer, non-deterministic outputs for MT.
+- **Exact chat framing** — BOS `120000` (`<｜hy_begin▁of▁sentence｜>`) prepended
+  by hand (the `gpt2-pre` tokenizer never adds it), stop on EOS `120020`
+  (`<｜hy_place▁holder▁no▁2｜>`), plus a repeat-run guard and whitespace/
+  terminator cleanup ported from RTranslator.
+- **One call per transcript** — ASR outputs (≤400 chars) go through a single
+  prefill; only long paragraphs fall back to per-sentence calls. Token budget
+  scales with input (64–128, 256 cap) instead of a flat 256.
+- **Small context** — `n_ctx=1024`, `n_batch/ubatch=512`: a translation prompt
+  (<200 tok) plus output never needs 2048.
+- **Optimized native build** — `cpp/CMakeLists.txt` forces `-O2` for Debug
+  (AGP always passes `Debug`, so an unguarded default silently compiled ggml
+  at `-O0`, 5–10× slower) and `-O3` for Release. Optional NEON dot-product
+  kernels via `-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod` on capable SoCs.
+- **Threads `cores-2`** (min 2), reserving headroom for ASR/TTS/UI.
 
-### Whisper ASR assets (current pipeline)
+Per-call timing is logged (`HyMtGgufJNI`: `prompt=N tok (prefill …) + M tok
+(gen …, tok/s)`) for direct comparison against RTranslator.
 
-The current Whisper graphs are custom exports (both validated against eager
-HuggingFace before quantizing; both installed as dynamic int8):
+## GGUF Asset Preparation
 
-```powershell
-python optimize/09_export_whisper_decoder_kv.py    # KV-cached decoder → whisper_decoder.onnx
-python optimize/10_export_whisper_encoder_dyn.py   # dynamic-length encoder → whisper_encoder.onnx
-
-# Pre-optimize offline — MUST run under onnxruntime==1.22.0 (matches the app):
-.venv-ort122\Scripts\python optimize\07_preoptimize.py --models whisper_decoder.onnx whisper_encoder.onnx
-
-# GATE — 8/8 must pass before shipping:
-.venv-ort122\Scripts\python -m pytest tests_local\test_06_onnx_parity.py -v
-```
-
-- `09` decoder: one uniform graph (no `If` branch) — prefill feeds the whole
-  prefix with empty pasts; every step feeds ONE token with an empty
-  `encoder_hidden_states`. Decoder presents are cumulative (cycled zero-copy);
-  encoder cross-K/V are returned at prefill and re-fed each step. The app
-  (`ASRModule.decodeWithCache`) mirrors this contract and falls back to
-  whole-sequence decode on cache-less graphs.
-- `10` encoder: accepts any mel length — `ASRModule` feeds only the audio's
-  real frames (the 3000-frame pad tail is skipped for short clips).
-
-Both read weights from the committed `android/app/src/main/assets/hf_cache/`
-(no HF download needed) and back up replaced assets under `onnx_models/`.
-Rollback paths are documented in `docs/optimization_results.md`.
-
-### NLLB / MMS-TTS assets (original pipeline)
+`*.gguf` files are **gitignored** — a fresh checkout must fetch the model
+before building the app (the STQ typefix below is size-neutral, so it is
+revision-gated, not size-gated):
 
 ```powershell
-# requirements.txt already lists the export stack (optimum, onnx, onnxruntime,
-# onnxruntime-extensions); on Linux you may additionally `pip install aimet-torch`
-# to enable the AIMET-only quantization method.
-pip install -r requirements.txt
-
-python optimize/01_export_onnx.py --verify      # Export all models
-python optimize/02_prune_vocab.py               # Prune NLLB vocabulary to VN/EN/CN
-python optimize/03_quantize_aimet.py --method onnx_int8   # Quantize to INT8
-python optimize/05_slim_decoder.py              # Slim the NLLB merged decoder
-python optimize/export_mms_tts.py --verify      # MMS-TTS models (vi / en)
-.venv-ort122\Scripts\python optimize\07_preoptimize.py --models encoder_model_int8.onnx  # pre-opt NLLB encoder
+python optimize/07_prepare_hymt_gguf.py   # download GGUF → assets + onnx_models/
 ```
+
+This verifies the 440 MB file, remaps legacy STQ tensor-type codes in place
+(`hymt_gguf_typefix.py`), and stages copies for the app and the backend.
 
 ## Android App
 
 The Android app is in `android/`. To build:
 
-1. Ensure the ONNX assets exist in `android/app/src/main/assets/` (they are
-   **gitignored** — on a fresh checkout regenerate them via the commands in
-   "ONNX Export"; on a machine that already ran the scripts they are in place
-   and a plain rebuild is enough)
+1. Ensure the ONNX/GGUF assets exist in `android/app/src/main/assets/`
+   (gitignored — regenerate via `optimize/`; on a machine that already ran
+   the scripts a plain rebuild is enough)
 2. Open the `android/` folder in **Android Studio** — the project uses **Gradle 9.5**
-   and requires **JDK 17+** (Android Studio bundles a compatible JDK; there is no
-   `gradlew` wrapper committed, so run `gradle assembleDebug` from `android/`
-   when building on the command line)
-3. Build → Make Project (or press Run ▶ on a connected device / emulator)
+   and requires **JDK 17+**
+3. Clean `.cxx` after any `cpp/CMakeLists.txt` change
+   (`Remove-Item -Recurse -Force android/app/.cxx`), then
+   Build → Make Project (or Run ▶ on a device)
 
-> The APK is built for **arm64-v8a only** (`abiFilters 'arm64-v8a'` in `app/build.gradle`).
-
-> Whisper assets: the decoder ships as a **KV-cached dynamic-int8** graph
-> (~196 MB, was 100% fp32 ~774 MB; the old cache-less export cost O(n²)
-> whole-sequence decode) and the encoder as a **dynamic-length dynamic-int8**
-> graph (~98 MB, accepts any mel length). The app prefers the offline
-> pre-optimized siblings (`*.opt.onnx`, loaded with NO_OPT for fast session
-> creation) and falls back to the base files. The fp32 originals and every
-> replaced asset are backed up under `onnx_models/`; regenerate with
-> `optimize/09` / `optimize/10` + `optimize/07` (see "ONNX Export"), then run
-> the parity gate. Validation: fp32 exports match eager HuggingFace logits
-> <1e-3 (prefill AND cached step); gate transcripts — en matches the PyTorch
-> reference exactly.
+> The APK is built for **arm64-v8a only** (`abiFilters 'arm64-v8a'`).
+> Input is **push-to-talk**: hold the button to record; recordings below the
+> RMS silence threshold are rejected before ASR (no VAD auto-listen yet).
 
 Required assets:
-- `encoder_model_int8.onnx` or `encoder_model_int8.opt.onnx` (NLLB encoder)
-- `decoder_model_merged_int8.onnx` (NLLB decoder — slimmed to drop the redundant
-  fp32 embedding, see `optimize/05_slim_decoder.py`; deliberately NOT pre-optimized)
-- `sentencepiece_bpe.model` (NLLB tokenizer; `language_token_map.json` optional)
-- `whisper_encoder.opt.onnx` (dynamic-length int8 — regenerate via `optimize/10` + `07`)
-- `whisper_decoder.opt.onnx` (KV-cached int8 — regenerate via `optimize/09` + `07`)
+- `Hy-MT1.5-1.8B-1.25bit.gguf` (translation, post-typefix revision)
+- `whisper_encoder.opt.onnx` (dynamic-length int8)
+- `whisper_decoder.opt.onnx` (KV-cached int8)
 - `whisper_preprocess.onnx` / `whisper_postprocess.onnx` / `whisper_vocab.json`
 - `mms_tts_vi.onnx` + `mms_tts_vi_vocab.json` (MMS-TTS Vietnamese)
 - `mms_tts_en.onnx` + `mms_tts_en_config.json` + `mms_tts_en_vocab.json` (MMS-TTS English)
 
-> APK size notes: the release APK is **~1.6 GB** (under the 2 GB target). The
-> ~1.2 GB HuggingFace `hf_cache/` folder (a build-time byproduct the app never
-> reads) is excluded from packaging via `aaptOptions.ignoreAssetsPattern
-> "hf_cache"` in `app/build.gradle`. Only arm64-v8a native libs are included.
+> APK size notes: the ~1.2 GB HuggingFace `hf_cache/` folder (a build-time
+> byproduct the app never reads) is excluded via `aaptOptions.ignoreAssetsPattern
+> "hf_cache"`. Only arm64-v8a native libs are included.
 
-
-> There is **no `mms_tts_zh` MMS-TTS asset** — Meta never released an MMS-TTS
-> Mandarin checkpoint (only Hakka `mms-tts-hak` and Min-Nan `mms-tts-nan`), so
-> Chinese TTS uses the device's Android **system** TextToSpeech engine.
->
-> The system fallback in `TTSModule` is fully automatic:
-> - The engine is created on the main thread and binds **explicitly** to the
->   best available engine — preferring `com.google.android.tts` (Google TTS),
->   otherwise the first installed engine that declares a TTS service — so it no
->   longer depends on the device's "default engine" setting.
-> - On the first failed Chinese synthesis it **auto-opens the system
->   voice-data installer** (`ACTION_INSTALL_TTS_DATA`) so the user can download
->   the Mandarin (普通话) voice, and it surfaces an actionable reason through
->   `getLastError()` / the TTS Toast (missing voice data, no default engine, or
->   no TTS engine installed at all).
->
-> Requirements for Chinese speech output:
-> - The APK declares `<queries>` for the TTS service intent (required for
->   Android 11+ **package visibility**), so the app can detect the engine
->   you install.
-> - An Android TTS engine with **Chinese voice data installed** (usually
->   Google TTS → Settings → Text-to-speech → Install voice data → 普通话).
-> - On emulators, use a **Google APIs / Play Store** AVD image — plain AOSP
->   images ship **no** TTS engine at all.
->
-> To add proper fully-offline Chinese TTS you'd integrate a Mandarin neural TTS
-> that ships ONNX (e.g. a Sherpa-ONNX VITS `zh` model with its G2P front-end) —
-> see `docs/` for details.
+> There is **no `mms_tts_zh` asset** — Meta never released an MMS-TTS Mandarin
+> checkpoint, so Chinese TTS uses the device's Android **system**
+> TextToSpeech engine (`synthesizeToFile` → played like any other output).
+> Requirements: a TTS engine with Chinese voice data installed (usually Google
+> TTS → Install voice data → 普通话); on emulators use a Google APIs / Play
+> Store image (plain AOSP ships no TTS engine).
 
 > The `mms_tts_*` files are optional — if a model isn't bundled, `TTSModule`
 > falls back to the Android system TextToSpeech engine for that language (which
 > is always the path used for Chinese).
 
+## Benchmarking On-Device
+
+```powershell
+adb logcat -s HyMtGgufJNI TranslationModule PipelineOrchestrator ASRModule
+```
+
+- `decode: prompt=N tok (prefill …ms) + M tok (gen …ms, …tok/s)` — translation
+- `Translation: "…" (…ms)` / `MEM[stage] totalPss=…MB` — per-stage pipeline stats
+
 ## Architecture
 
 - **Modular pipeline stages** — clear I/O contracts between ASR, Translation, TTS
-- **Streaming-class ASR decode** — KV-cached zero-copy greedy decode
-  (`decodeWithCache`: prefill-held encoder K/V, cumulative decoder presents,
-  per-step cost constant) with whole-sequence fallback; row-only logits argmax
-  (no full `[seq × 51865]` Java materialization per step)
+- **Decoder-only translation** — instruction-prompted Hy-MT1.5 (no seq2seq
+  encoder graphs, no SentencePiece BPE, no beam search)
+- **Streaming-class ASR decode** — KV-cached zero-copy greedy decode with
+  whole-sequence fallback; row-only logits argmax
 - **Short-window encoder** — dynamic-length encoder input; short clips feed only
   their real mel frames (~10× less encoder compute for a 3 s clip)
-- **ONNX Runtime** for all model inference (same as RTranslator-2.00); offline
-  pre-optimized graphs (`*.opt.onnx`) loaded with NO_OPT; mobile-tuned session
-  options (`OrtSessionConfig`: low-RAM arena/mem-pattern handling, NNAPI/XNNPACK A/B flags)
-- **Qualcomm AI Hub** as primary optimization path (not vendor-locked)
-- **Wearable-ready** — pipeline design allows hardware swap without redesign;
-  resident model weights ~1.29 GB (see `docs/optimization_results.md`)
+- **ONNX Runtime** for Whisper inference (offline pre-optimized `*.opt.onnx`
+  loaded with NO_OPT); **llama.cpp** for translation
+- **Push-to-talk input** — single-thread pipeline executor with latest-wins
+  cancel; silence rejected by an RMS energy gate after recording
 - **Two-backend TTS** — neural MMS-TTS (ONNX) for VN/EN when bundled, with the
   Android system TextToSpeech engine as an automatic fallback (and the only
   backend for Chinese)
