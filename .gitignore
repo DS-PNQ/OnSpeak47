@@ -36,3 +36,12 @@ android/.idea/
 .venv-ort122/
 .zcode/
 .pytest_cache/
+
+# Native third-party caches / tarballs (vendored llama.cpp source stays tracked)
+android/app/src/main/cpp/third_party/*.tar.gz
+android/app/.cxx/
+
+# Local-only artifacts (never push: 4GB APK exceeds GitHub limits,
+# .tmp_rtranslator/ is 1GB RTranslator analysis scratch)
+*.apk
+.tmp_rtranslator/

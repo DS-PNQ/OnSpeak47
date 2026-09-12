@@ -4,7 +4,9 @@
 # CPU-only: plain `torch` resolves to the CPU wheel on Windows/PyPI.
 torch>=2.2
 transformers>=4.42
-sentencepiece>=0.1.99   # required by NLLB-200 tokenizer
+llama-cpp-python>=0.3.9    # Hy-MT low-RAM profile: 1.25-bit STQ GGUF (llama.cpp + STQ kernel)
+onnxruntime-genai>=1.22.0  # Hy-MT high-end profile: INT4 ONNX via ONNX Runtime GenAI
+sentencepiece>=0.1.99   # MMS-TTS tokenizer / legacy tooling
 protobuf>=3.20          # needed for some slow-tokenizer conversions (sentencepiece path)
 accelerate>=0.30        # smoother device_map / low-mem model loading in transformers
 soundfile>=0.12         # audio-file decode backend used by librosa.load (ASR input)

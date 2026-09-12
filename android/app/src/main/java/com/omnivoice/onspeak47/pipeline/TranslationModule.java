@@ -1,5 +1,17 @@
 /*
- * OmniVoice — Translation Module (NLLB-200 via ONNX Runtime)
+ * OmniVoice — Translation Module (Tencent Hy-MT1.5, single GGUF path)
+ *
+ * ALL translation traffic goes through exactly one backend: the
+ * Hy-MT1.5-1.8B 1.25-bit STQ GGUF (440 MB) decoded on the mobile CPU by
+ * llama.cpp + the STQ kernel (llama.cpp PR #22836) via HyMtGgufJNI.
+ *
+ * The former dual-profile design (LOW_RAM GGUF / HIGH_END INT4 ONNX via
+ * ONNX Runtime GenAI) is gone: the INT4 path was dead weight in this
+ * project — the onnxruntime-genai AAR was never bundled in app/libs, so
+ * the code could never load it, while its ~1.25 GB of assets shipped in
+ * every APK. RTranslator-side comparison also showed the GGUF path can
+ * match its latency once the native build is optimized (see cpp/
+ * CMakeLists.txt) and greedy decoding is used (see hymt_gguf_jni.cpp).
  */
 
 package com.omnivoice.onspeak47.pipeline;
@@ -10,396 +22,195 @@ import android.util.Log;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.Locale;
-import java.util.Map;
-import java.util.Optional;
 
-import ai.onnxruntime.OnnxTensor;
-import ai.onnxruntime.OnnxValue;
-import ai.onnxruntime.OrtEnvironment;
-import ai.onnxruntime.OrtException;
-import ai.onnxruntime.OrtSession;
 import com.omnivoice.onspeak47.util.FileUtils;
-import com.omnivoice.onspeak47.util.OrtSessionConfig;
-import com.omnivoice.onspeak47.util.TensorUtils;
 
 public class TranslationModule {
 
     private static final String TAG = "TranslationModule";
 
-    private static final String ENCODER_FILE = "encoder_model_int8.onnx";
-    private static final String DECODER_FILE = "decoder_model_merged_int8.onnx";
-    private static final String VOCAB_FILE = "sentencepiece_bpe.model";
-    private static final String LANG_TOKEN_MAP_FILE = "language_token_map.json";
+    // Single backend asset: 1.25-bit STQ GGUF (tencent/Hy-MT1.5-1.8B-1.25bit-GGUF)
+    private static final String GGUF_ASSET = "Hy-MT1.5-1.8B-1.25bit.gguf";
+    // Content revision of the GGUF asset ("2" = post typefix: the legacy
+    // STQ1_0(42) tensor type codes remapped to 43 by optimize/
+    // hymt_gguf_typefix.py so the vendored llama.cpp accepts the header).
+    // That fix rewrites tensor-info header bytes IN PLACE and does not change
+    // the file size, so an extracted pre-fix copy cannot be detected by
+    // length — a device that copied the broken file under an older APK would
+    // keep loading it forever. Bump whenever the asset's bytes change again.
+    private static final String GGUF_ASSET_REV = "2";
 
-    private static final int MAX_OUTPUT_TOKENS = 256;
+    private static final int MAX_OUTPUT_TOKENS = 128;
+    private static final int MAX_OUTPUT_TOKENS_LONG = 256;
+    // Single-call threshold: ASR transcripts (~1-2 sentences, <400 chars) go
+    // through ONE prefill. Only long paragraphs pay per-sentence prefills.
+    // Mirrors RTranslator's join-up-to-maxLength strategy (5000 tok) instead
+    // of the old split-every-sentence loop that multiplied prefill cost.
+    private static final int SINGLE_CALL_CHAR_THRESHOLD = 400;
 
-    private final OrtEnvironment env;
-    private final OrtSession encoderSession;
-    private final OrtSession decoderSession;
-    private final Tokenizer tokenizer;
+    // Obsolete dual-profile extraction (see class comment); reclaimed on boot.
+    private static final String DEAD_INT4_DIR = "hymt_int4_onnx";
 
-    private static final Map<String, String> NLLB_CODES = new HashMap<>();
-    static {
-        NLLB_CODES.put("vi", "vie_Latn");
-        NLLB_CODES.put("en", "eng_Latn");
-        NLLB_CODES.put("zh", "zho_Hans");
-    }
+    private long ggufHandle = 0;
 
-    public TranslationModule(Context context) throws OrtException {
-        env = OrtEnvironment.getEnvironment();
-
-        // Use External Files Dir to avoid C: drive issues
+    public TranslationModule(Context context) throws Exception {
         File baseDir = context.getExternalFilesDir(null);
-        if (baseDir == null) {
-            baseDir = context.getFilesDir();
+        if (baseDir == null) baseDir = context.getFilesDir();
+
+        // Reclaim the ~1.25 GB INT4 extraction written by the old dual-profile
+        // builds on devices that still have it on disk.
+        File wasted = new File(baseDir, DEAD_INT4_DIR);
+        if (wasted.isDirectory()) {
+            Log.i(TAG, "Removing obsolete INT4 model extraction: " + wasted);
+            deleteRecursive(wasted);
         }
 
-        String vocabPath = copyModel(context, baseDir, VOCAB_FILE);
+        if (!assetExists(context, GGUF_ASSET)) {
+            Log.e(TAG, "GGUF asset missing from APK: " + GGUF_ASSET
+                    + " — translate() will return an error");
+            return;
+        }
+        loadGguf(context, baseDir);
+    }
 
-        // Copy language token map (generated by 02_prune_vocab.py) if present
-        copyModelOptional(context, baseDir, LANG_TOKEN_MAP_FILE);
-
-        // Sessions prefer offline pre-optimized graphs (*.opt.onnx from
-        // optimize/07_preoptimize.py) with NO_OPT runtime and resolve the opt
-        // sibling FIRST: 07_preoptimize.py moves the base asset out of the APK
-        // (to onnx_models/preopt_backup/), so e.g. the NLLB encoder ships only
-        // as encoder_model_int8.opt.onnx. The base asset is copied only when no
-        // opt sibling is bundled (ALL_OPT runtime config in that case).
-        encoderSession = createSessionPreferPreopt(context, baseDir, ENCODER_FILE);
-        decoderSession = createSessionPreferPreopt(context, baseDir, DECODER_FILE);
-
-        // Pass the base dir so Tokenizer can find language_token_map.json
-        tokenizer = new Tokenizer(vocabPath, baseDir.getAbsolutePath(), Tokenizer.NLLB);
-
-        // Log tokenizer init state for debugging
-        if (tokenizer.isReady()) {
-            Log.i(TAG, "Tokenizer ready — SP vocab size (dictionaryLength): "
-                    + tokenizer.getDictionaryLength());
+    /**
+     * Copies the GGUF asset (revision-gated) and loads it via llama.cpp.
+     *
+     * Threads: cores-2 (min 2). The 4-thread cap was a big.LITTLE-era
+     * heuristic; on the homogeneous flagships this app targets (SM8850 /
+     * Snapdragon 8 Elite: 8x Oryon, no little cores) it left 2 fast cores
+     * idle and regressed throughput vs the previous cores-2 build. cores-2
+     * also reserves headroom for the ASR/TTS/UI work alongside each call.
+     */
+    private void loadGguf(Context context, File baseDir) {
+        String path = copyModel(context, baseDir, GGUF_ASSET);
+        int cores = Runtime.getRuntime().availableProcessors();
+        int threads = Math.max(2, cores - 2);
+        // n_ctx 1024 covers prompt (<200 tok) + gen (<=256) with far less KV
+        // memory-bandwidth than 2048; n_batch is set to 512 in JNI.
+        ggufHandle = HyMtGgufJNI.loadModel(path, 1024, threads);
+        if (ggufHandle == 0) {
+            Log.e(TAG, "llama.cpp failed to load GGUF from " + path);
         } else {
-            Log.e(TAG, "Tokenizer FAILED to initialize: " + tokenizer.getInitError());
+            Log.i(TAG, "llama.cpp loaded GGUF successfully (threads=" + threads + ")");
         }
     }
+
+    private static void deleteRecursive(File f) {
+        File[] children = f.listFiles();
+        if (children != null) {
+            for (File c : children) deleteRecursive(c);
+        }
+        if (!f.delete()) {
+            Log.w(TAG, "Could not delete " + f);
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Public API (unchanged contract)
+    // ----------------------------------------------------------------
 
     public TranslationResult translate(String text, String srcLang, String tgtLang) {
         long startTime = System.currentTimeMillis();
         if (text == null || text.trim().isEmpty()) {
             return new TranslationResult("", 0);
         }
-
-        // Fail fast with a descriptive message if the tokenizer never loaded
-        if (!tokenizer.isReady()) {
-            String reason = tokenizer.getInitError();
-            Log.e(TAG, "Cannot translate — tokenizer not initialized: " + reason);
-            return new TranslationResult("[error: tokenizer not loaded — " + reason + "]",
-                    System.currentTimeMillis() - startTime);
+        String cleaned = correctText(text);
+        // Fast path (common ASR case): ONE LLM call, ONE prefill.
+        if (cleaned.length() <= SINGLE_CALL_CHAR_THRESHOLD) {
+            String out = translateSentence(cleaned, srcLang, tgtLang);
+            Log.i(TAG, "translate single-call chars=" + cleaned.length()
+                    + " (" + (System.currentTimeMillis() - startTime) + "ms)");
+            return new TranslationResult(out, System.currentTimeMillis() - startTime);
         }
-
-        String nllbSrc = getNllbCode(srcLang);
-        String nllbTgt = getNllbCode(tgtLang);
-
-        ArrayList<String> sentences = splitIntoSentences(text, srcLang);
+        // Slow path (long paragraph): per-sentence calls.
+        ArrayList<String> sentences = splitIntoSentences(cleaned, srcLang);
         StringBuilder result = new StringBuilder();
-
         for (String sentence : sentences) {
             if (sentence.trim().isEmpty()) continue;
-            String translated = translateSentence(ensureTerminator(sentence, srcLang),
-                    nllbSrc, nllbTgt);
+            String translated = translateSentence(sentence, srcLang, tgtLang);
             if (result.length() > 0) result.append(" ");
             result.append(translated);
         }
-
-        long elapsed = System.currentTimeMillis() - startTime;
-        return new TranslationResult(result.toString(), elapsed);
+        Log.i(TAG, "translate multi-call sentences=" + sentences.size()
+                + " (" + (System.currentTimeMillis() - startTime) + "ms)");
+        return new TranslationResult(result.toString(), System.currentTimeMillis() - startTime);
     }
 
-    /**
-     * NLLB quality: a missing sentence terminator measurably degrades output
-     * (RTranslator applies the same fix). Adds one based on the SOURCE
-     * language — ideographic full stop for Chinese.
-     */
-    private static String ensureTerminator(String text, String srcLang) {
-        String t = text.trim();
-        if (t.length() < 2) return t;
-        char last = t.charAt(t.length() - 1);
-        if (!Character.isLetterOrDigit(last)) return t;
-        return t + (srcLang != null && srcLang.startsWith("zh") ? "。" : ".");
+    // ----------------------------------------------------------------
+    // HY-MT prompting (decoder-only: instruction instead of lang tokens)
+    // ----------------------------------------------------------------
+
+    private String translateSentence(String text, String srcLang, String tgtLang) {
+        String instruction = buildInstruction(text, srcLang, tgtLang);
+        int budget = estimateMaxTokens(text);
+        String raw = (ggufHandle != 0)
+                ? HyMtGgufJNI.complete(ggufHandle, instruction, budget)
+                : "[error: GGUF model not loaded]";
+        return clean(raw);
     }
 
-    private String translateSentence(String text, String nllbSrc, String nllbTgt) {
-        OrtSession.Result encoderResult = null;
-        try {
-            Tokenizer.TokenizerResult input = tokenizer.tokenize(nllbSrc, nllbTgt, text);
-            if (input == null) {
-                String reason = tokenizer.getInitError();
-                return "[error: tokenization failed"
-                        + (reason != null ? " — " + reason : "") + "]";
-            }
+    /** Token budget by input length: short ASR -> 48-128, long -> 256 cap. */
+    private static int estimateMaxTokens(String text) {
+        int len = text == null ? 0 : text.length();
+        if (len <= 60) return 64;
+        if (len <= SINGLE_CALL_CHAR_THRESHOLD) return MAX_OUTPUT_TOKENS;
+        return MAX_OUTPUT_TOKENS_LONG;
+    }
 
-            OnnxTensor inputIds = TensorUtils.intArrayToTensor(env, input.inputIDs);
-            OnnxTensor mask = TensorUtils.intArrayToTensor(env, input.attentionMask);
-            Map<String, OnnxTensor> encoderInputs = new HashMap<>();
-            encoderInputs.put("input_ids", inputIds);
-            encoderInputs.put("attention_mask", mask);
+    /** Port of RTranslator correctText(): terminator + whitespace collapse. */
+    private static String correctText(String text) {
+        String t = text.trim().replaceAll("\\s+", " ");
+        if (t.length() >= 2 && Character.isLetterOrDigit(t.charAt(t.length() - 1))) {
+            t += ".";
+        }
+        return t;
+    }
 
-            encoderResult = encoderSession.run(encoderInputs);
-            inputIds.close();
+    /** ZH<=>XX → Chinese instruction; XX<=>XX → English instruction (Hy-MT README). */
+    private static String buildInstruction(String text, String srcLang, String tgtLang) {
+        boolean zhInvolved = srcLang.startsWith("zh") || tgtLang.startsWith("zh");
+        if (zhInvolved) {
+            return "将以下文本翻译为" + zhName(tgtLang) + "，注意只需要输出翻译后的结果，不要额外解释：\n\n" + text;
+        }
+        return "Translate the following segment into " + enName(tgtLang)
+                + ", without additional explanation.\n\n" + text;
+    }
 
-            OnnxTensor encoderOutput = (OnnxTensor) encoderResult.get("last_hidden_state").get();
-
-            ArrayList<Integer> outputIds = greedyDecode(encoderOutput, mask, nllbTgt,
-                    input.inputIDs.length);
-
-            int[] outputArray = new int[outputIds.size()];
-            for (int i = 0; i < outputIds.size(); i++) {
-                outputArray[i] = outputIds.get(i);
-            }
-            String translation = tokenizer.decode(outputArray);
-
-            mask.close();
-            return translation;
-        } catch (OrtException e) {
-            Log.e(TAG, "Dịch lỗi", e);
-            return "[error]";
-        } finally {
-            if (encoderResult != null) encoderResult.close();
+    private static String enName(String code) {
+        switch (code) {
+            case "vi": return "Vietnamese";
+            case "zh_hant": return "Traditional Chinese";
+            case "zh": case "zh_hans": return "Chinese";
+            default: return "English";
         }
     }
 
-    /**
-     * Greedy decode, matching HuggingFace's greedy_search contract for
-     * NLLB/M2M-100: decoder prefix [</s> (bos = id 2), &lt;target_lang&gt;],
-     * sampling from the last logits position each step. Dispatches to the
-     * KV-cached fast path and falls back to the O(n^2) whole-sequence path
-     * for cache-less graphs or if the cached path fails at runtime.
-     */
-    private ArrayList<Integer> greedyDecode(OnnxTensor encoderOutput, OnnxTensor mask, String nllbTgt,
-                                            int inputLen) throws OrtException {
-        final int eosId = tokenizer.pieceToId("</s>");   // NLLB eos == bos == 2
-        final int targetLangId = tokenizer.getLanguageID(nllbTgt);
-
-        // RTranslator's runaway guard: a healthy greedy decode never emits
-        // more than a small multiple of the input length (8x for very short
-        // inputs); beyond that the model is looping and every extra step is
-        // wasted RAM + latency.
-        int genLimit = Math.max(16, (inputLen < 10 ? 8 : 4) * inputLen);
-        int maxTokens = Math.min(MAX_OUTPUT_TOKENS, genLimit);
-
-        // Names and contract of the optional KV-cache inputs.
-        boolean hasCacheBranch = false;
-        ArrayList<String> decoderPastNames = new ArrayList<>();
-        ArrayList<String> encoderPastNames = new ArrayList<>();
-        for (String inputName : decoderSession.getInputNames()) {
-            if (inputName.equals("use_cache_branch")) {
-                hasCacheBranch = true;
-            } else if (inputName.startsWith("past_key_values")) {
-                if (inputName.contains(".encoder.")) encoderPastNames.add(inputName);
-                else decoderPastNames.add(inputName);
-            }
-        }
-        if (decoderPastNames.isEmpty() && encoderPastNames.isEmpty()) {
-            // Cache-less decoder graph — O(n^2) whole-sequence fallback.
-            return greedyDecodeNoCache(encoderOutput, mask, eosId, targetLangId,
-                    hasCacheBranch, decoderPastNames, encoderPastNames, maxTokens);
-        }
-
-        // Fast path: KV-cached decode. Validated against the exact Xenova
-        // (and slimmed) decoder_model_merged_int8 graphs, but if THIS runtime
-        // rejects the use_cache_branch=true step for any reason, fall back to
-        // the whole-sequence path (which only exercises the else-branch and
-        // matches the previously working on-device behaviour) instead of
-        // failing the translation.
-        try {
-            return greedyDecodeWithCache(encoderOutput, mask, eosId, targetLangId,
-                    hasCacheBranch, decoderPastNames, encoderPastNames, maxTokens);
-        } catch (Exception e) {
-            Log.e(TAG, "KV-cache decode failed — falling back to whole-sequence "
-                    + "decode (slower). Cause: " + e.getMessage(), e);
-            return greedyDecodeNoCache(encoderOutput, mask, eosId, targetLangId,
-                    hasCacheBranch, decoderPastNames, encoderPastNames, maxTokens);
+    private static String zhName(String code) {
+        switch (code) {
+            case "vi": return "越南语";
+            case "en": return "英语";
+            case "zh_hant": return "繁体中文";
+            default: return "中文";
         }
     }
 
-    /**
-     * Greedy decode with the merged graph's KV cache, using the zero-copy
-     * pattern proven by RTranslator:
-     *
-     * <ul>
-     *   <li>Prefill: feed [</s> (bos = id 2), &lt;target_lang&gt;] once with
-     *       use_cache_branch=false and empty past tensors; sample from the last
-     *       logits position.</li>
-     *   <li>Decode steps: feed exactly ONE new token with use_cache_branch=true.
-     *       The `present.*` tensors owned by the previous step's
-     *       OrtSession.Result are passed straight back in as `past_key_values.*`
-     *       (no Java-side copy), and the previous Result is closed only AFTER
-     *       the next run has consumed them — each step frees the prior step's
-     *       memory immediately without ever cloning the KV tensors.</li>
-     * </ul>
-     */
-    private ArrayList<Integer> greedyDecodeWithCache(OnnxTensor encoderOutput, OnnxTensor mask,
-                                                     int eosId, int targetLangId,
-                                                     boolean hasCacheBranch,
-                                                     ArrayList<String> decoderPastNames,
-                                                     ArrayList<String> encoderPastNames,
-                                                     int maxTokens) throws OrtException {
-        ArrayList<Integer> outputIds = new ArrayList<>();
-        // Cross-attention K/V are constant after prefill: the quantized
-        // merged graph's then-branch emits malformed (batch=0) encoder
-        // presents, so the prefill Result must stay open and its encoder
-        // presents are re-fed on EVERY step (RTranslator's cache-initializer
-        // pattern). Only the decoder self-attention pasts cycle between steps.
-        OrtSession.Result prefillResult = null;
-        OrtSession.Result result = null;
-        try {
-            // ---- Prefill: [bos, target_lang] with empty past. ----
-            Map<String, OnnxTensor> inputs = new HashMap<>();
-            ArrayList<OnnxTensor> created = new ArrayList<>();   // tensors this step owns (must close)
-            addDecoderStepInputs(inputs, created, new int[]{eosId, targetLangId},
-                    encoderOutput, mask, hasCacheBranch, false,
-                    decoderPastNames, encoderPastNames, null, null);
-
-            while (true) {
-                OrtSession.Result newResult;
-                try {
-                    newResult = decoderSession.run(inputs);
-                } finally {
-                    // The run consumed our small per-step tensors; the past
-                    // tensors inside `inputs` are owned by open Results.
-                    for (OnnxTensor t : created) t.close();
-                }
-                // Free the previous step's Result only now — its decoder
-                // `present` tensors were inputs to the run that just
-                // completed. Never close the prefill Result here: after the
-                // first iteration it is aliased by `result`, and its encoder
-                // presents must stay alive for every remaining step (it is
-                // closed in the finally below).
-                if (result != null && result != prefillResult) result.close();
-                result = newResult;
-                if (prefillResult == null) prefillResult = newResult;
-
-                float[][][] logits = (float[][][]) result.get("logits").get().getValue();
-                int next = TensorUtils.argmax(logits[0][logits[0].length - 1]);
-                if (next == eosId) break;               // done; EOS not appended to output
-                outputIds.add(next);
-                if (outputIds.size() >= maxTokens) break;
-
-                // ---- Next step: one token, cache branch on. Decoder pasts
-                // come from the previous step; encoder pasts from prefill. ----
-                inputs = new HashMap<>();
-                created = new ArrayList<>();
-                addDecoderStepInputs(inputs, created, new int[]{next},
-                        encoderOutput, mask, hasCacheBranch, true,
-                        decoderPastNames, encoderPastNames, result, prefillResult);
-            }
-        } finally {
-            if (result != null) result.close();
-            if (prefillResult != null && prefillResult != result) prefillResult.close();
-        }
-        return outputIds;
-    }
-
-    /**
-     * Assembles one decoder step's input map. Tensors created here are added to
-     * {@code created} so the caller can close them right after the run;
-     * {@code encoderOutput}/{@code mask} are caller-owned and Result-owned
-     * past tensors are not closed here. When {@code pastSource} is null
-     * (prefill), empty past tensors are supplied; on decode steps, decoder
-     * pasts cycle from {@code pastSource} and encoder pasts are re-fed from
-     * {@code prefillSource}.
-     */
-    private void addDecoderStepInputs(Map<String, OnnxTensor> inputs, ArrayList<OnnxTensor> created,
-                                      int[] tokenIds, OnnxTensor encoderOutput, OnnxTensor mask,
-                                      boolean hasCacheBranch, boolean useCache,
-                                      ArrayList<String> decoderPastNames, ArrayList<String> encoderPastNames,
-                                      OrtSession.Result pastSource, OrtSession.Result prefillSource) throws OrtException {
-        OnnxTensor ids = TensorUtils.intArrayToTensor(env, tokenIds);
-        inputs.put("input_ids", ids);
-        created.add(ids);
-        inputs.put("encoder_hidden_states", encoderOutput);
-        inputs.put("encoder_attention_mask", mask);
-        if (hasCacheBranch) {
-            OnnxTensor flag = TensorUtils.booleanToTensor(env, useCache);
-            inputs.put("use_cache_branch", flag);
-            created.add(flag);
-        }
-        for (String n : decoderPastNames) putPastInput(inputs, created, n, pastSource);
-        for (String n : encoderPastNames) {
-            putPastInput(inputs, created, n, pastSource != null ? prefillSource : null);
-        }
-    }
-
-    /** Maps a `past_key_values.*` input to the matching `present.*` output of
-     *  the previous Result (zero-copy). A missing `present` output mid-decode
-     *  means the graph violates the merged-export contract — fail loudly
-     *  instead of silently feeding an empty past (which corrupts the
-     *  cross-attention cache). */
-    private void putPastInput(Map<String, OnnxTensor> inputs, ArrayList<OnnxTensor> created,
-                              String pastName, OrtSession.Result pastSource) throws OrtException {
-        OnnxTensor t = null;
-        if (pastSource != null) {
-            String presentName = pastName.replaceFirst("^past_key_values\\.", "present.");
-            Optional<OnnxValue> v = pastSource.get(presentName);
-            if (v.isPresent()) t = (OnnxTensor) v.get();
-            else throw new OrtException("decoder did not return '" + presentName + "'");
-        }
-        if (t == null) {
-            // NLLB-distilled-600M: 16 heads x 64 head_dim (batch=1, seq=0).
-            t = TensorUtils.createFloatTensor(env, new long[]{1, 16, 0, 64});
-            created.add(t);
-        }
-        inputs.put(pastName, t);
-    }
-
-    /**
-     * Whole-sequence fallback (O(n^2)): re-feeds the accumulated sequence
-     * with use_cache_branch=false and empty past tensors each step, exercising
-     * only the graph's else-branch. Builds inputs via addDecoderStepInputs so
-     * the FULL input contract is fed — a merged graph still requires
-     * use_cache_branch and every past_key_values input on each run
-     * ("Missing Input" otherwise).
-     */
-    private ArrayList<Integer> greedyDecodeNoCache(OnnxTensor encoderOutput, OnnxTensor mask,
-                                                   int eosId, int targetLangId,
-                                                   boolean hasCacheBranch,
-                                                   ArrayList<String> decoderPastNames,
-                                                   ArrayList<String> encoderPastNames,
-                                                   int maxTokens) throws OrtException {
-        ArrayList<Integer> decoderSeq = new ArrayList<>();
-        decoderSeq.add(eosId);
-        decoderSeq.add(targetLangId);
-
-        ArrayList<Integer> outputIds = new ArrayList<>();
-        for (int step = 0; step < maxTokens; step++) {
-            Map<String, OnnxTensor> inputs = new HashMap<>();
-            ArrayList<OnnxTensor> created = new ArrayList<>();
-            addDecoderStepInputs(inputs, created, toIntArray(decoderSeq), encoderOutput, mask,
-                    hasCacheBranch, false, decoderPastNames, encoderPastNames, null, null);
-            try (OrtSession.Result stepResult = decoderSession.run(inputs)) {
-                float[][][] logits = (float[][][]) stepResult.get("logits").get().getValue();
-                int next = TensorUtils.argmax(logits[0][logits[0].length - 1]);
-                if (next == eosId) {
-                    break;                       // done; EOS not appended to output
-                }
-                outputIds.add(next);
-                decoderSeq.add(next);
-            } finally {
-                for (OnnxTensor t : created) t.close();
-            }
-        }
-        return outputIds;
-    }
-
-    private static int[] toIntArray(ArrayList<Integer> list) {
-        int[] arr = new int[list.size()];
-        for (int i = 0; i < list.size(); i++) arr[i] = list.get(i);
-        return arr;
+    private static String clean(String raw) {
+        if (raw == null) return "";
+        int cut = raw.indexOf("<｜hy_");
+        if (cut >= 0) raw = raw.substring(0, cut);
+        raw = raw.replaceAll("</?(think|answer)>", "");
+        return raw.trim();
     }
 
     private ArrayList<String> splitIntoSentences(String text, String langCode) {
         ArrayList<String> sentences = new ArrayList<>();
-        Locale locale = langCode.equals("vi") ? new Locale("vi") : Locale.US;
+        Locale locale = langCode != null && langCode.equals("vi") ? new Locale("vi") : Locale.US;
         BreakIterator iterator = BreakIterator.getSentenceInstance(locale);
         iterator.setText(text);
         int start = iterator.first();
@@ -409,77 +220,63 @@ public class TranslationModule {
         return sentences;
     }
 
-    private String getNllbCode(String langCode) {
-        return NLLB_CODES.getOrDefault(langCode, "vie_Latn");
-    }
-
-    /**
-     * Copy an asset to the base directory, ignoring errors if it doesn't
-     * exist in APK assets (used for optional config files like
-     * language_token_map.json).
-     */
-    private void copyModelOptional(Context context, File baseDir, String assetName) {
-        File outFile = new File(baseDir, assetName);
-        if (outFile.exists()) return;
-        try {
-            context.getAssets().open(assetName).close(); // check if exists
-            FileUtils.copyAssetToDir(context, assetName, baseDir);
-        } catch (java.io.IOException e) {
-            Log.d(TAG, "Optional asset not found in APK: " + assetName);
-        }
-    }
-
-    /**
-     * Creates a session preferring the offline pre-optimized sibling
-     * ({@code <name>.opt.onnx} from optimize/07_preoptimize.py, loaded with
-     * NO_OPT) and falling back to the base asset (ALL_OPT). The opt sibling
-     * REPLACES the base asset in the APK, so it is resolved first and the
-     * base asset is only copied when the opt file is not bundled.
-     */
-    private OrtSession createSessionPreferPreopt(Context context, File baseDir,
-                                                 String assetName) throws OrtException {
-        String optAsset = assetName.replace(".onnx", ".opt.onnx");
-        String optPath = copyModelOptionalPath(context, baseDir, optAsset);
-        if (optPath != null) {
-            OrtSession.SessionOptions options = OrtSessionConfig.create(context, true, true);
+    private boolean assetExists(Context context, String assetPath) {
+        try (InputStream is = context.getAssets().open(assetPath)) {
+            return true;
+        } catch (IOException e) {
+            // Check if it's a directory
             try {
-                Log.i(TAG, "Loading pre-optimized " + optAsset);
-                return env.createSession(optPath, options);
-            } finally {
-                options.close();
+                String[] list = context.getAssets().list(assetPath);
+                return list != null && list.length > 0;
+            } catch (IOException ex) {
+                return false;
             }
         }
-        // No pre-optimized sibling bundled — fall back to the base asset
-        // (copyModel throws a descriptive error if it is missing as well).
-        String basePath = copyModel(context, baseDir, assetName);
-        OrtSession.SessionOptions options = OrtSessionConfig.create(context, true, false);
-        try {
-            return env.createSession(basePath, options);
-        } finally {
-            options.close();
-        }
-    }
-
-    /** Like {@link #copyModel}, but returns null (and copies nothing) when
-     *  the asset is not bundled in the APK. */
-    private String copyModelOptionalPath(Context context, File baseDir, String assetName) {
-        File outFile = new File(baseDir, assetName);
-        if (outFile.exists()) return outFile.getAbsolutePath();
-        try {
-            context.getAssets().open(assetName).close();
-        } catch (IOException e) {
-            return null;
-        }
-        FileUtils.copyAssetToDir(context, assetName, baseDir);
-        return outFile.getAbsolutePath();
     }
 
     private String copyModel(Context context, File baseDir, String assetName) {
         File outFile = new File(baseDir, assetName);
+        // Revision gate: the GGUF typefix was size-neutral, so drop any
+        // extracted copy that predates the current asset revision and let
+        // FileUtils re-copy it from the APK.
+        File revFile = new File(baseDir, assetName + ".rev");
+        String diskRev = readRevMarker(revFile);
+        if (outFile.exists() && !GGUF_ASSET_REV.equals(diskRev)) {
+            Log.i(TAG, "Asset revision changed for " + assetName + " (disk '"
+                    + diskRev + "' != APK '" + GGUF_ASSET_REV + "') — recopying");
+            outFile.delete();
+            revFile.delete();
+        }
         if (!outFile.exists()) {
             FileUtils.copyAssetToDir(context, assetName, baseDir);
+            writeRevMarker(revFile);
         }
         return outFile.getAbsolutePath();
+    }
+
+    /** Sidecar "<asset>.rev" content; "" when absent or unreadable. */
+    private static String readRevMarker(File revFile) {
+        try {
+            return new String(Files.readAllBytes(revFile.toPath()), StandardCharsets.UTF_8).trim();
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
+    /** Best-effort; failure only costs a redundant recopy on next launch. */
+    private static void writeRevMarker(File revFile) {
+        try {
+            Files.write(revFile.toPath(), GGUF_ASSET_REV.getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            Log.w(TAG, "Could not write revision marker " + revFile, e);
+        }
+    }
+
+    public void close() {
+        if (ggufHandle != 0) {
+            HyMtGgufJNI.freeModel(ggufHandle);
+            ggufHandle = 0;
+        }
     }
 
     public static class TranslationResult {

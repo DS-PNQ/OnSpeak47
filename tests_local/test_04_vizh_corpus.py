@@ -1,6 +1,6 @@
 # Large-corpus VI↔ZH BLEU evaluation
 #
-# Uses the 1000-pair test corpus from ``test vi-zh/`` to score NLLB quality
+# Uses the 1000-pair test corpus from ``test vi-zh/`` to score Hy-MT quality
 # on the VI↔CN pair — the single biggest technical risk flagged in
 # pipeline_overview.md (Risk #1).
 
@@ -83,7 +83,7 @@ class TestViZhCorpus:
         """Evaluate vi → en → zh_hans pivot path.
 
         This is ~2× slower (two translation hops) but may yield higher
-        quality for the VN↔CN pair where NLLB direct weights are weaker.
+        quality for the VN↔CN pair where direct weights are weaker.
         """
         pairs = vizh_test_data[:50]  # Fewer pairs since it's 2× cost
         references = [p["zh_hans"] for p in pairs]
@@ -109,7 +109,7 @@ class TestViZhCorpus:
 
         Compares BLEU with and without ``preprocess_chinese()`` on zh inputs.
         """
-        from backend.translation_nllb import NLLBTranslator
+        from backend.translation_hymt import HyMTTranslator
 
         pairs = vizh_test_data[:50]
         references = [p["vi"] for p in pairs]
@@ -120,7 +120,7 @@ class TestViZhCorpus:
         bleu_raw = sacrebleu.corpus_bleu(hyp_raw, [references], tokenize="13a")
 
         # With preprocessing
-        processed_sources = [NLLBTranslator.preprocess_chinese(s) for s in raw_sources]
+        processed_sources = [HyMTTranslator.preprocess_chinese(s) for s in raw_sources]
         hyp_processed = translator.translate_batch(processed_sources, "zh_hans", "vi", batch_size=8)
         bleu_processed = sacrebleu.corpus_bleu(hyp_processed, [references], tokenize="13a")
 

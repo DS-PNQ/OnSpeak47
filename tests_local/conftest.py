@@ -26,9 +26,9 @@ _results: list[dict] = []
 
 @pytest.fixture(scope="session")
 def translator():
-    from backend.translation_nllb import NLLBTranslator
+    from backend.translation_hymt import HyMTTranslator
 
-    return NLLBTranslator()
+    return HyMTTranslator()
 
 
 @pytest.fixture(scope="session")
@@ -158,9 +158,9 @@ def pytest_sessionfinish(session, exitstatus):
     out_path = DOCS_DIR / "translation_quality_results.md"
 
     lines = [
-        "# NLLB-200 Translation Quality Results",
+        "# Hy-MT1.5 Translation Quality Results",
         "",
-        f"Model: `facebook/nllb-200-distilled-600M`",
+        f"Model: `tencent/Hy-MT1.5-1.8B-1.25bit-GGUF` (HY-MT dual-profile)",
         f"Run date: {datetime.date.today().isoformat()}",
         "Test sentences: `tests_local/data/parallel_sentences.json`",
         "",

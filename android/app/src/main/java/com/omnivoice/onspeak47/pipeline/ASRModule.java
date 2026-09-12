@@ -885,7 +885,13 @@ public class ASRModule {
 
     private String copyModelToInternal(Context context, String assetName) {
         File outFile = new File(context.getFilesDir(), assetName);
-        if (!outFile.exists()) FileUtils.copyAssetToInternal(context, assetName);
+        // Always delegate to FileUtils: it validates an existing extraction
+        // against the APK asset's size and re-copies on mismatch. The old
+        // `if (!outFile.exists())` guard short-circuited that check, so a
+        // stale extraction from an older APK (e.g. the 352 MB FP32 encoder
+        // after the asset switched back to the 98 MB INT8 one) kept being
+        // loaded forever even after the fixed APK was installed.
+        FileUtils.copyAssetToInternal(context, assetName);
         return outFile.getAbsolutePath();
     }
 

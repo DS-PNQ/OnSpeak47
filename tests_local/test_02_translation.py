@@ -1,4 +1,4 @@
-# Quality tests for NLLB (crucial for VN<->CN weights)
+# Quality tests for Hy-MT1.5 (crucial for VN<->CN weights)
 
 import math
 

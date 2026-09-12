@@ -1,9 +1,11 @@
 # OmniVoice — Model Export & Download Script
 #
 # Automates the setup of ONNX models for the Android app.
-# 1. Downloads NLLB-200 quantized models from Hugging Face.
-# 2. Exports Whisper Small to ONNX using Optimum.
-# 3. Places all files directly into the Android assets directory.
+# 1. Exports Whisper Small to ONNX using Optimum.
+# 2. Places all files directly into the Android assets directory.
+#
+# Translation (Hy-MT) assets are prepared by 07_prepare_hymt_gguf.py
+# (low-RAM 1.25-bit GGUF) and 08_export_hymt_onnx_int4.py (INT4 ONNX).
 
 from __future__ import annotations
 
@@ -19,19 +21,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 log = logging.getLogger(__name__)
 
 # Target directory: Output to a dedicated folder on D:
-ASSETS_DIR = Path("D:/StudioProjects/OmniVoice/onnx_models")
+ASSETS_DIR = Path("D:/StudioProjects/OmniVoice3/onnx_models")
 
-# URLs for NLLB-200 (Xenova's quantized versions)
-NLLB_ENCODER_URL = "https://huggingface.co/Xenova/nllb-200-distilled-600M/resolve/main/onnx/encoder_model_int8.onnx?download=true"
-NLLB_DECODER_URL = "https://huggingface.co/Xenova/nllb-200-distilled-600M/resolve/main/onnx/decoder_model_merged_int8.onnx?download=true"
-
-# SentencePiece tokenizer from the official facebook/nllb-200-distilled-600M checkpoint.
-# Xenova's ONNX export does not bundle the .model file, so we pull it from the
-# original repo. The app expects the asset name `sentencepiece_bpe.model`
-# (see TranslationModule.VOCAB_FILE), while HF names it `sentencepiece.bpe.model`
-# (dots) — always write it under the underscore name.
-NLLB_TOKENIZER_URL = "https://huggingface.co/facebook/nllb-200-distilled-600M/resolve/main/sentencepiece.bpe.model"
-NLLB_TOKENIZER_ASSET_NAME = "sentencepiece_bpe.model"
+# Hy-MT translation assets are NOT handled here anymore — see
+# 07_prepare_hymt_gguf.py and 08_export_hymt_onnx_int4.py.
 
 def download_file(url: str, output_path: Path):
     """Download a file with progress logging."""
@@ -57,52 +50,7 @@ def download_file(url: str, output_path: Path):
             output_path.unlink()
 
 
-def setup_nllb_tokenizer(assets_dir: Path):
-    """Download the NLLB-200 SentencePiece model and save it under the
-    asset name the app expects.
 
-    ``02_prune_vocab.py`` only prunes embedding rows for language control
-    tokens — it never regenerates or modifies the SentencePiece ``.model``
-    file itself. The tokenizer is therefore identical between the original
-    facebook/nllb-200-distilled-600M checkpoint and any pruned variant, so
-    it can be exported verbatim here.
-    """
-    target = assets_dir / NLLB_TOKENIZER_ASSET_NAME
-    if target.exists() and target.stat().st_size > 0:
-        log.info(f"  [Skip] {target.name} already exists.")
-        return
-
-    tmp_target = assets_dir / (NLLB_TOKENIZER_ASSET_NAME + ".tmp")
-    try:
-        download_file(NLLB_TOKENIZER_URL, tmp_target)
-        if not tmp_target.exists():
-            log.error(f"  [Error] Failed to download {NLLB_TOKENIZER_ASSET_NAME}")
-            return
-        # Atomic-ish rename: tmp_target -> final name (handles 'dots' vs
-        # 'underscores' naming mismatch and removes the .tmp suffix).
-        if target.exists():
-            target.unlink()
-        tmp_target.rename(target)
-        log.info(f"  [Done] Exported NLLB tokenizer -> {target.name} "
-                 f"({target.stat().st_size / 1e6:.1f} MB)")
-    except Exception as e:
-        log.error(f"  [Error] Failed to export NLLB tokenizer: {e}")
-        if tmp_target.exists():
-            tmp_target.unlink()
-
-
-def setup_nllb(assets_dir: Path):
-    """Download pre-quantized NLLB-200 models."""
-    log.info("Setting up NLLB-200 models...")
-    assets_dir.mkdir(parents=True, exist_ok=True)
-
-    download_file(NLLB_ENCODER_URL, assets_dir / "encoder_model_int8.onnx")
-    download_file(NLLB_DECODER_URL, assets_dir / "decoder_model_merged_int8.onnx")
-
-    # The ONNX weights are useless without the SentencePiece tokenizer that
-    # produced their inputs.  Export it alongside the weights so the app has
-    # everything it needs after a single run of this script.
-    setup_nllb_tokenizer(assets_dir)
 
 def export_whisper(assets_dir: Path):
     """Export Whisper Small using Optimum and move to assets."""
@@ -248,24 +196,56 @@ def export_whisper_processing(assets_dir: Path):
              "it expects WhisperBeamSearch-shaped input, see comment above.")
 
 
+def check_android_encoder_asset(assets_dir: Path):
+    """Guard against shipping a slow FP32 Whisper encoder to the APK.
+
+    The Android app must bundle the dynamic-frame INT8 encoder produced by
+    optimize/10_export_whisper_encoder_dyn.py (``onnx_models/
+    whisper_encoder_dyn_int8.onnx``). This script only produces the raw
+    Optimum FP32 export; copying that over the Android asset (as happened on
+    2026-09-08) regresses ASR to roughly 3-4x slower — 352 MB FP32 with a
+    fixed 3000-frame window vs 98 MB INT8 with dynamic frames — exactly the
+    "ASR is much slower than before" report from the device. Compare sizes
+    and fail the script loudly when they diverge.
+    """
+    android_asset = (Path(__file__).resolve().parent.parent / "android" / "app"
+                     / "src" / "main" / "assets" / "whisper_encoder.onnx")
+    canonical = assets_dir / "whisper_encoder_dyn_int8.onnx"
+    if not android_asset.exists() or not canonical.exists():
+        return
+    want = canonical.stat().st_size
+    have = android_asset.stat().st_size
+    if have != want:
+        log.error(
+            "android/app/src/main/assets/whisper_encoder.onnx is %d bytes but the "
+            "canonical INT8 dynamic export (whisper_encoder_dyn_int8.onnx) is %d bytes. "
+            "The bundled asset is probably a raw FP32 re-export from 01_export_onnx.py; "
+            "restore it with:  copy onnx_models/whisper_encoder_dyn_int8.onnx "
+            "android/app/src/main/assets/whisper_encoder.onnx",
+            have, want,
+        )
+        sys.exit(2)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Download or Export ONNX models to Android assets")
     parser.add_argument("--assets-dir", type=Path, default=ASSETS_DIR)
     parser.add_argument(
         "--models",
         nargs="+",
-        choices=["nllb", "whisper", "all"],
+        choices=["whisper", "all"],
         default=["all"],
     )
     args = parser.parse_args()
 
-    models = args.models if "all" not in args.models else ["nllb", "whisper"]
+    models = args.models if "all" not in args.models else ["whisper"]
 
-    if "nllb" in models:
-        setup_nllb(args.assets_dir)
     if "whisper" in models:
         export_whisper(args.assets_dir)
         export_whisper_processing(args.assets_dir)
+
+    # Never leave the Android asset as a raw FP32 export — see the docstring.
+    check_android_encoder_asset(args.assets_dir)
 
     log.info("Workflow complete. Large models are now in assets/.")
     log.info("IMPORTANT: Add *.onnx and *.model to your .gitignore before pushing!")

@@ -35,7 +35,7 @@ android {
         targetCompatibility JavaVersion.VERSION_11
     }
     androidResources {
-        noCompress 'onnx', 'model', 'onnx_data', 'json', 'bin'
+        noCompress 'onnx', 'model', 'onnx_data', 'json', 'bin', 'gguf'
     }
     // The HuggingFace download cache written by optimize/*.py is a build-time
     // byproduct (~1.2 GB of model.safetensors + tokenizer blobs) that the app
@@ -55,6 +55,15 @@ android {
         abortOnError false
     }
 
+    // llama.cpp with the STQ kernel (llama.cpp PR #22836) — decodes the
+    // Hy-MT 1.25-bit GGUF on the mobile CPU (LOW_RAM profile).
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
 
     // Allow large ONNX model files in assets
 }
@@ -72,6 +81,10 @@ dependencies {
     // ONNX Runtime for on-device model inference
     implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.22.0'
     implementation 'com.microsoft.onnxruntime:onnxruntime-extensions-android:0.13.0'
+
+    // NOTE: the former optional onnxruntime-genai AAR (fileTree libs) was
+    // removed with the HIGH_END INT4 profile — translation is single-path
+    // GGUF now (see pipeline/TranslationModule.java).
 
 
     // SentencePiece tokenization: uses pure-Java SentencePieceProcessor

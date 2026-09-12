@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from backend.asr_whisper import WhisperASR, ASRResult
-from backend.translation_nllb import NLLBTranslator
+from backend.translation_hymt import HyMTTranslator
 from backend.tts_mms import MMSTTS
 
 
@@ -39,11 +39,11 @@ class OmniVoicePipeline:
     def __init__(
         self,
         asr: WhisperASR | None = None,
-        translator: NLLBTranslator | None = None,
+        translator: HyMTTranslator | None = None,
         tts: MMSTTS | None = None,
     ):
         self.asr = asr or WhisperASR()
-        self.translator = translator or NLLBTranslator()
+        self.translator = translator or HyMTTranslator()
         self.tts = tts or MMSTTS()
 
     # ------------------------------------------------------------------

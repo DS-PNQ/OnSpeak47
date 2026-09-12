@@ -50,31 +50,19 @@ def sacrebleu_score(hyps: list[str], refs: list[str], tgt: str) -> float:
     return sacrebleu.corpus_bleu(hyps, [refs], tokenize=tok).score
 
 
-def gen_nllb(sentences: list[dict]) -> dict:
-    from backend.translation_nllb import LANG_CODES, NLLBTranslator
-    import torch
+def gen_hymt(sentences: list[dict]) -> dict:
+    from backend.translation_hymt import HyMTTranslator
 
-    t = NLLBTranslator()
-    tok, model = t.tokenizer, t.model
+    t = HyMTTranslator()
     bleus: dict[str, float] = {}
     hyp_store: dict[str, list[str]] = {}
     for src, tgt in DIRECTIONS:
         texts = [s[src] for s in sentences]
         refs = [s[tgt] for s in sentences]
-        tok.src_lang = LANG_CODES[src]
-        forced_bos = tok.convert_tokens_to_ids(LANG_CODES[tgt])
-        inputs = tok(texts, return_tensors="pt", padding=True, truncation=True, max_length=256)
-        with torch.no_grad():
-            generated = model.generate(
-                **inputs,
-                forced_bos_token_id=forced_bos,
-                num_beams=1, do_sample=False,   # greedy — mirrors the on-device decode
-                max_length=256,
-            )
-        hyps = tok.batch_decode(generated, skip_special_tokens=True)
+        hyps = t.translate_batch(texts, src, tgt)
         bleus[f"{src}->{tgt}"] = sacrebleu_score(hyps, refs, tgt)
         hyp_store[f"{src}->{tgt}"] = hyps
-        log.info(f"NLLB {src}->{tgt}: BLEU={bleus[f'{src}->{tgt}']:.2f}")
+        log.info(f"Hy-MT {src}->{tgt}: BLEU={bleus[f'{src}->{tgt}']:.2f}")
     return {"bleu": bleus, "hypotheses": hyp_store}
 
 
@@ -108,8 +96,8 @@ def main() -> None:
 
     reference: dict = {"meta": {"date": str(date.today()), "decode": "greedy"}}
 
-    log.info("Generating NLLB reference (PyTorch, greedy)…")
-    reference["nllb"] = gen_nllb(sentences)
+    log.info("Generating Hy-MT reference (greedy)…")
+    reference["hymt"] = gen_hymt(sentences)
 
     try:
         log.info("Generating Whisper ASR reference + fixtures…")
