@@ -47,6 +47,36 @@ public final class AsrState {
     public static final float W_CONFIDENCE = 0.15f;
     public static final float W_HISTORY = 0.10f;
 
+    // --- Bootstrap acoustic LID (fakedemo2 §7-§8, §17) ---
+    // Bootstrap answers "which language does this utterance START with?"
+    // from AUDIO only — never from the active-ASR transcript (that path is
+    // circular: VI decodes EN/ZH into Vietnamese-like text which then votes
+    // VI again). Thresholds are starting points for on-device tuning, not
+    // absolute optima.
+    /** Minimum speech audio before the first bootstrap attempt. */
+    public static final int BOOTSTRAP_MIN_MS = 200;
+    /** Audio window fed to the acoustic LID classifier. */
+    public static final int BOOTSTRAP_LID_WINDOW_MS = 300;
+    /** Extended window when the first attempt is uncertain (§9 cách 1). */
+    public static final int BOOTSTRAP_MAX_MS = 400;
+    /** top1 must reach this to commit a bootstrap language. */
+    public static final float BOOTSTRAP_THRESHOLD = 0.70f;
+    /** top1 - top2 must reach this (never force VI on max-probability). */
+    public static final float BOOTSTRAP_MARGIN = 0.15f;
+    /** bootstrapScore = 0.90 * acoustic + 0.10 * prior (text/history off). */
+    public static final float BOOTSTRAP_W_ACOUSTIC = 0.90f;
+    public static final float BOOTSTRAP_W_PRIOR = 0.10f;
+
+    // --- Runtime LID weights (fakedemo2 §18, starting point) ---
+    // Kept separate from W_* above (which the current tuned pipeline + tests
+    // rely on). Retune towards these once the real acoustic scorer lands:
+    // ASR confidence only says the model trusts its own hypothesis, not that
+    // the audio is that language — so its weight stays minimal.
+    public static final float RUNTIME_W_ACOUSTIC = 0.65f;
+    public static final float RUNTIME_W_TEXT = 0.20f;
+    public static final float RUNTIME_W_CONFIDENCE = 0.05f;
+    public static final float RUNTIME_W_HISTORY = 0.10f;
+
     public static final float SWITCH_THRESHOLD = 0.72f;
     public static final float SWITCH_MARGIN = 0.20f;
     /** Endpoint (inter-utterance) bar, spec §13.1: boundaries are cheap

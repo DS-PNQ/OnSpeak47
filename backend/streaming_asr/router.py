@@ -1,10 +1,13 @@
 """Router state machine — mirrors LanguageRouter.java (spec §10-§15, MUST 5/6)."""
 from dataclasses import dataclass
 from .config import (SWITCH_THRESHOLD, SWITCH_MARGIN, SWITCH_PERSIST_MS, EMA_ALPHA,
-                     ENDPOINT_THRESHOLD, ENDPOINT_MARGIN)
+                      ENDPOINT_THRESHOLD, ENDPOINT_MARGIN,
+                      BOOTSTRAP_THRESHOLD, BOOTSTRAP_MARGIN)
 
 
 class RouterState:
+    UNKNOWN = "UNKNOWN"
+    BOOTSTRAPPING = "BOOTSTRAPPING"
     ACTIVE = "ACTIVE"
     CANDIDATE_SWITCH = "CANDIDATE_SWITCH"
     ROLLBACK = "ROLLBACK"
@@ -28,11 +31,13 @@ class LanguageRouter:
         self.persist_ms = persist_ms
         self.discard_cooldown_ms = discard_cooldown_ms
         self.clock = clock or (lambda: int(time.time() * 1000))
-        self.active = "vi"
+        # fakedemo2 §6, §22: never start as "vi" — start UNKNOWN; bootstrap
+        # acoustic LID commits the first language per utterance.
+        self.active = "und"
         self.active_confidence = 1.0 / 3
         self.candidate = None
         self._candidate_since = -1
-        self.state = RouterState.ACTIVE
+        self.state = RouterState.UNKNOWN
         self.verifier = None
         self.switch_count = 0
         self.last_switch_ms = -1
@@ -46,7 +51,45 @@ class LanguageRouter:
         self.active = lang or "und"
         self.active_confidence = max(0.0, min(1.0, conf))
         self._clear_candidate()
+        self.state = (RouterState.UNKNOWN if self.active == "und"
+                      else RouterState.ACTIVE)
+
+    def is_bootstrapping(self) -> bool:
+        """True while no language is committed (fakedemo2 §22)."""
+        return self.active == "und"
+
+    def commit_bootstrap(self, lang: str, conf: float) -> None:
+        """Commit the bootstrap decision; never called with 'und'."""
+        if not lang or lang == "und":
+            return
+        self.active = lang
+        self.active_confidence = max(0.0, min(1.0, conf))
+        self._clear_candidate()
         self.state = RouterState.ACTIVE
+
+    def on_bootstrap_lid_result(self, lid) -> str:
+        """Bootstrap gate (§22, §42): top1 >= 0.70 AND top1-top2 >= 0.15.
+
+        Returns the committed language, or 'und' while still uncertain
+        (caller extends the window or runs ≤2 speculative candidates —
+        never forces VI on a bare max-probability).
+        """
+        if lid is None or not getattr(lid, "language", None) or lid.language == "und":
+            self.state = RouterState.BOOTSTRAPPING
+            return "und"
+        if self.active != "und":
+            return self.active
+        top1 = lid.confidence
+        top2 = 0.0
+        for lang, score in (lid.scores or {}).items():
+            if lang == lid.language or lang == "und" or score is None:
+                continue
+            top2 = max(top2, score)
+        if top1 >= BOOTSTRAP_THRESHOLD and (top1 - top2) >= BOOTSTRAP_MARGIN:
+            self.commit_bootstrap(lid.language, top1)
+            return self.active
+        self.state = RouterState.BOOTSTRAPPING
+        return "und"
 
     def on_partial_confidence(self, token_conf: float) -> None:
         c = max(0.0, min(1.0, token_conf))
@@ -55,6 +98,10 @@ class LanguageRouter:
     def on_lid_result(self, lid) -> str:
         """Returns HOLD | OBSERVE | START_ROLLBACK | COMMITTED | DISCARDED."""
         if lid is None or lid.language is None:
+            return "HOLD"
+        # Bootstrap owns the UND phase (§23): runtime hysteresis must not
+        # vote while no active model exists.
+        if self.active == "und":
             return "HOLD"
         cand = lid.language
         if cand == self.active or cand == "und":
@@ -151,10 +198,10 @@ class LanguageRouter:
         self.state = RouterState.ACTIVE
 
     def reset(self) -> None:
-        self.active = "vi"
+        self.active = "und"
         self.active_confidence = 1.0 / 3
         self._clear_candidate()
-        self.state = RouterState.ACTIVE
+        self.state = RouterState.UNKNOWN
         self.switch_count = 0
         self.last_switch_ms = -1
         self._last_discard_ms = -10 ** 12

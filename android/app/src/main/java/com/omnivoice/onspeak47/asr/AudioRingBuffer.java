@@ -80,6 +80,25 @@ public class AudioRingBuffer {
         return last((int) ((long) AsrState.SAMPLE_RATE * windowMs / 1000));
     }
 
+    /**
+     * Samples appended since {@code startPos} (see {@link #totalWritten}),
+     * oldest-first, capped at {@code maxSamples}. Used to replay the current
+     * utterance from its speech start (§15, §25) — {@link #lastMs} would
+     * return trailing silence instead when the request happens at an
+     * endpoint after seconds of silence.
+     */
+    public synchronized float[] since(long startPos, int maxSamples) {
+        long end = writePos;
+        long start = Math.max(startPos, end - capacity);
+        start = Math.max(start, end - Math.max(0, maxSamples));
+        int n = (int) Math.max(0, end - start);
+        float[] out = new float[n];
+        for (int i = 0; i < n; i++) {
+            out[i] = buf[(int) ((start + i) % capacity)];
+        }
+        return out;
+    }
+
     public synchronized void clear() {
         writePos = 0;
         droppedSamples = 0;

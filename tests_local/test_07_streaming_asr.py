@@ -238,7 +238,12 @@ def test_pipeline_emits_partials_every_160ms():
         engines[lang] = e
         return e
 
-    p = StreamingPipeline(clock=clock, factory=factory)
+    # Confident VI acoustic LID: bootstrap commits VI at ~200 ms, then live
+    # decoding proceeds on the VI engine (fakedemo2 §7: audio decides, and
+    # the buffered 200 ms are replayed — not dropped).
+    p = StreamingPipeline(clock=clock, factory=factory,
+                          acoustic_scorer=lambda audio: {"vi": 0.9, "en": 0.05, "zh": 0.05})
+    assert p.active_lang == "und"  # UNKNOWN until bootstrap (§6)
     vi = engines["vi"]
     # 1 s of speech: 50 frames x 20 ms → ~6 scheduler chunks → ≥4 partials.
     t = 0
@@ -330,6 +335,236 @@ def test_pipeline_endpoint_finalizes_utterance():
     assert p.metrics.utterances >= 1
 
 
+# --- Bootstrap acoustic LID (fakedemo2 §6–§9, §46 acceptance) ---------------
+
+def test_router_starts_unknown_and_gates_bootstrap():
+    now, clock = make_clock()
+    router = LanguageRouter(clock=clock)
+    # §6: never ACTIVE+VI at start — UNKNOWN until bootstrap commits.
+    assert router.active == "und"
+    assert router.is_bootstrapping()
+    # Runtime hysteresis must not fire while bootstrapping (§23).
+    assert router.on_lid_result(
+        LidResult("en", 0.95, {"en": 0.95, "vi": 0.03, "zh": 0.02})) == "HOLD"
+    # Confident VI (0.82, margin 0.69) commits.
+    d = router.on_bootstrap_lid_result(
+        LidResult("vi", 0.82, {"vi": 0.82, "en": 0.13, "zh": 0.05}))
+    assert d == "vi" and router.active == "vi"
+    assert not router.is_bootstrapping()
+
+
+def test_router_bootstrap_uncertain_stays_unknown():
+    now, clock = make_clock()
+    router = LanguageRouter(clock=clock)
+    # VI 0.46 / EN 0.43: must NOT force VI on max-probability (§8).
+    d = router.on_bootstrap_lid_result(
+        LidResult("vi", 0.46, {"vi": 0.46, "en": 0.43, "zh": 0.11}))
+    assert d == "und" and router.active == "und"
+    assert router.is_bootstrapping()
+    # Below-threshold top1 also stays UNKNOWN.
+    router.reset()
+    d = router.on_bootstrap_lid_result(
+        LidResult("en", 0.65, {"en": 0.65, "vi": 0.25, "zh": 0.10}))
+    assert d == "und"
+
+
+def test_bootstrap_uses_audio_not_transcript():
+    # Even a strongly VI transcript must not sway bootstrap: audio decides.
+    lid = LanguageIdEngine(
+        acoustic_scorer=lambda audio: {"en": 0.9, "vi": 0.05, "zh": 0.05})
+    r = lid.classify_bootstrap([0.2] * 4800)
+    assert r.language == "en" and r.confidence >= 0.70
+    # No scorer → flat audio prior → uncertain (extend/candidates, §17).
+    flat = LanguageIdEngine(acoustic_scorer=None)
+    # NOTE: default pipeline wires the heuristic; a bare None scorer is the
+    # "no acoustic model" unit case and must stay flat, never VI-locked.
+    flat.acoustic_scorer = None
+    r = flat.classify_bootstrap([0.2] * 4800)
+    assert abs(r.scores["vi"] - r.scores["en"]) < 1e-6
+
+
+def test_pipeline_en_utterance_starts_with_en_recognizer():
+    """§46: EN-only utterance starts with the EN recognizer (no VI smear)."""
+    now, clock = make_clock()
+    engines = {}
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        if lang == "en":
+            e.decode_hook = lambda fed: ("let us start the meeting", 0.9) if fed >= 1600 else ("", 0.5)
+        if lang == "vi":
+            e.decode_hook = lambda fed: ("let gi ta mit ting", 0.3)
+        return e
+
+    p = StreamingPipeline(clock=clock, factory=factory,
+                          acoustic_scorer=lambda audio: {"en": 0.86, "vi": 0.09, "zh": 0.05})
+    t = 0
+    for _ in range(15):  # 300 ms — bootstrap commits at ~200 ms
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    assert p.active_lang == "en", "bootstrap must commit EN from audio"
+    for _ in range(15):
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    for _ in range(120):  # endpoint
+        t += 20
+        now[0] = t
+        p.on_frame([0.0] * 320, t)
+    finals = [e for e in p.events if e[0] == "final"]
+    assert finals and "meeting" in finals[-1][1]
+    assert "let gi" not in finals[-1][1], "VI phonetic smear leaked into final"
+    assert finals[-1][2] == "en"
+
+
+def test_pipeline_uncertain_bootstrap_uses_at_most_two_models():
+    """§10/§32: uncertain bootstrap decodes ≤2 candidates, never 3."""
+    now, clock = make_clock()
+    engines = {}
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        if lang == "vi":
+            e.decode_hook = lambda fed: ("xin chào mọi người", 0.85) if fed >= 1600 else ("", 0.5)
+        return e
+
+    p = StreamingPipeline(clock=clock, factory=factory)  # heuristic: uncertain by design
+    t = 0
+    for _ in range(40):  # 800 ms of VI speech
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    # Live phase only (before endpoint): at most 2 engines may have decoded.
+    fed = {lang: e.fed_samples for lang, e in engines.items()}
+    assert sum(1 for v in fed.values() if v > 0) <= 2, fed
+    for _ in range(120):
+        t += 20
+        now[0] = t
+        p.on_frame([0.0] * 320, t)
+    finals = [e for e in p.events if e[0] == "final"]
+    assert finals and "xin chào" in finals[-1][1]
+
+
+def test_pipeline_short_blip_never_forces_vi():
+    """§35: a 60 ms blip with no evidence finalizes empty on UND."""
+    now, clock = make_clock()
+    engines = {}
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        return e
+
+    p = StreamingPipeline(clock=clock, factory=factory)
+    t = 0
+    for _ in range(3):  # 60 ms — below BOOTSTRAP_MIN_MS
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    for _ in range(120):
+        t += 20
+        now[0] = t
+        p.on_frame([0.0] * 320, t)
+    finals = [e for e in p.events if e[0] == "final"]
+    assert finals, "expected a FINAL after endpoint silence"
+    assert finals[-1][1] == "" and finals[-1][2] == "und"
+    assert p.active_lang == "und"
+
+
+# --- Provisional speculative decode (Option A hotfix) --------------------
+
+def test_provisional_partials_flow_while_unknown():
+    """Partials must be visible ~160 ms after speech starts even though the
+    language is not committed yet (the stuck-UNKNOWN regression)."""
+    now, clock = make_clock()
+    engines = {}
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        if lang == "vi":
+            e.decode_hook = lambda fed: ("xin chào", 0.8) if fed >= 1600 else ("", 0.5)
+        return e
+
+    p = StreamingPipeline(clock=clock, factory=factory)
+    t = 0
+    for _ in range(9):  # 180 ms — below BOOTSTRAP_MIN_MS, still UNKNOWN
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    assert p.active_lang == "und"
+    partials = [e for e in p.events if e[0] == "partial"]
+    assert partials, "provisional decode must emit partials while UNKNOWN"
+    assert partials[-1][2] == "xin chào"
+    # ... but nothing is committed yet (§11).
+    assert p.transcripts.committed == ""
+
+
+def test_provisional_adopted_on_same_language_commit():
+    """Bootstrap VI adopts the live provisional stream: final keeps the
+    early words (no replay gap, no duplication)."""
+    now, clock = make_clock()
+    engines = {}
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        if lang == "vi":
+            e.decode_hook = lambda fed: ("xin chào mọi người", 0.9) if fed >= 1600 else ("", 0.5)
+        return e
+
+    p = StreamingPipeline(clock=clock, factory=factory,
+                          acoustic_scorer=lambda audio: {"vi": 0.9, "en": 0.05, "zh": 0.05})
+    t = 0
+    for _ in range(30):
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    assert p.active_lang == "vi"
+    for _ in range(120):
+        t += 20
+        now[0] = t
+        p.on_frame([0.0] * 320, t)
+    finals = [e for e in p.events if e[0] == "final"]
+    assert finals and finals[-1][1] == "xin chào mọi người"
+    assert finals[-1][2] == "vi"
+
+
+def test_provisional_discarded_on_other_language_commit():
+    """Provisional VI garbage must leave no trace in an EN final."""
+    now, clock = make_clock()
+    engines = {}
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        if lang == "vi":
+            e.decode_hook = lambda fed: ("o a e o", 0.3) if fed >= 1600 else ("", 0.5)
+        if lang == "en":
+            e.decode_hook = lambda fed: ("good morning team", 0.9) if fed >= 1600 else ("", 0.5)
+        return e
+
+    p = StreamingPipeline(clock=clock, factory=factory,
+                          acoustic_scorer=lambda audio: {"en": 0.9, "vi": 0.05, "zh": 0.05})
+    t = 0
+    for _ in range(30):
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    assert p.active_lang == "en"
+    for _ in range(120):
+        t += 20
+        now[0] = t
+        p.on_frame([0.0] * 320, t)
+    finals = [e for e in p.events if e[0] == "final"]
+    assert finals and "good morning" in finals[-1][1]
+    assert "o a e" not in finals[-1][1]
+    assert finals[-1][2] == "en"
+
+
 def _run_utterance(p, now, engines, partials, silence_frames=120):
     """Feed speech partials then trailing silence; returns final time."""
     t = now[0]
@@ -346,12 +581,12 @@ def _run_utterance(p, now, engines, partials, silence_frames=120):
 
 
 def test_endpoint_verification_switches_to_better_candidate():
-    """Whole English utterance under VI lock flips to EN at the endpoint.
+    """Whole English utterance bootstraps straight to EN from audio.
 
-    The text-only router can never observe EN (flat acoustic prior +
-    constant confidence cap the fused score below the 0.72 gate), so the
-    endpoint replay through the EN engine is the only inter-utterance
-    escape hatch.
+    Before the fakedemo2 fix the pipeline decoded everything with the VI
+    engine first and needed endpoint replay as an escape hatch. Now the
+    bootstrap acoustic LID commits EN at ~200 ms from the audio alone, so
+    the utterance never locks to the wrong model in the first place.
     """
     now, clock = make_clock()
     engines = {}
@@ -363,20 +598,22 @@ def test_endpoint_verification_switches_to_better_candidate():
             e.decode_hook = lambda fed: ("now lets discuss the project plan", 0.9)
         return e
 
-    p = StreamingPipeline(clock=clock, factory=factory)
-    assert p.active_lang == "vi"
+    def acoustic_en(audio):
+        return {"en": 0.9, "vi": 0.05, "zh": 0.05}
+
+    p = StreamingPipeline(clock=clock, factory=factory, acoustic_scorer=acoustic_en)
+    assert p.active_lang == "und"
     # VI decodes English audio as low-confidence garbage.
     partials = [("o fre e o", 0.3)] * 30  # 600 ms of speech
     _run_utterance(p, now, engines, partials)
-    assert p.active_lang == "en", "endpoint replay should commit EN"
-    kinds = [e[0] for e in p.events]
-    assert "switch" in kinds
+    assert p.active_lang == "und", "next utterance restarts UNKNOWN (§45)"
     finals = [e for e in p.events if e[0] == "final"]
     assert finals and "discuss" in finals[-1][1]
+    assert finals[-1][2] == "en", "bootstrap must commit EN from audio"
 
 
 def test_endpoint_verification_keeps_active_when_candidate_weak():
-    """No confident candidate → active language stands, no spurious switch."""
+    """No confident candidate → VI utterance finalizes VI, no switch."""
     now, clock = make_clock()
     engines = {}
 
@@ -387,21 +624,25 @@ def test_endpoint_verification_keeps_active_when_candidate_weak():
             e.decode_hook = lambda fed: ("", 0.2)
         return e
 
-    p = StreamingPipeline(clock=clock, factory=factory)
+    p = StreamingPipeline(clock=clock, factory=factory,
+                          acoustic_scorer=lambda audio: {"vi": 0.9, "en": 0.05, "zh": 0.05})
+    assert p.active_lang == "und"
     partials = [("xin chào mọi người", 0.9)] * 30
     _run_utterance(p, now, engines, partials)
-    assert p.active_lang == "vi"
+    assert p.active_lang == "und", "next utterance restarts UNKNOWN (§45)"
     assert not [e for e in p.events if e[0] == "switch"]
     finals = [e for e in p.events if e[0] == "final"]
     assert finals and "xin chào" in finals[-1][1]
+    assert finals[-1][2] == "vi"
 
 
 def test_endpoint_lexical_switch_single_english_word():
-    """A lone 'HELLO' under VI lock flips to EN via lexical evidence.
+    """A lone 'HELLO' resolves to EN via the speculative dual-candidate.
 
-    One whitespace token never passes the generic length gate, but a
-    dictionary-strength lexical fit opens the single-unit exception — the
-    exact case from the device log (VI "HEO" @0.47 vs EN "HELLO").
+    No confident acoustic LID (default heuristic stays uncertain by design),
+    so the pipeline decodes the bootstrap window on VI+EN once (§32): EN's
+    'HELLO' @0.78 beats VI's 'HEO' @0.47 on confidence + lexical fit, and
+    the utterance commits EN instead of locking VI.
     """
     now, clock = make_clock()
     engines = {}
@@ -411,15 +652,17 @@ def test_endpoint_lexical_switch_single_english_word():
         engines[lang] = e
         if lang == "en":
             e.decode_hook = lambda fed: ("HELLO", 0.78)
+        if lang == "vi":
+            e.decode_hook = lambda fed: ("HEO", 0.47)
         return e
 
     p = StreamingPipeline(clock=clock, factory=factory)
-    assert p.active_lang == "vi"
+    assert p.active_lang == "und"
     partials = [("HEO", 0.47)] * 30
     _run_utterance(p, now, engines, partials)
-    assert p.active_lang == "en", "lexical evidence should flip lone HELLO"
     finals = [e for e in p.events if e[0] == "final"]
     assert finals and finals[-1][1] == "HELLO"
+    assert finals[-1][2] == "en"
 
 
 def test_endpoint_loanword_stays_vietnamese():
@@ -430,17 +673,20 @@ def test_endpoint_loanword_stays_vietnamese():
     def factory(lang):
         e = FakeEngine(lang)
         engines[lang] = e
+        if lang == "vi":
+            e.decode_hook = lambda fed: ("Hôm nay tôi có meeting", 0.8)
         if lang == "en":
             e.decode_hook = lambda fed: ("hom nay toi co", 0.35)
         return e
 
     p = StreamingPipeline(clock=clock, factory=factory)
+    assert p.active_lang == "und"
     partials = [("Hôm nay tôi có meeting", 0.8)] * 30
     _run_utterance(p, now, engines, partials)
-    assert p.active_lang == "vi"
     assert not [e for e in p.events if e[0] == "switch"]
     finals = [e for e in p.events if e[0] == "final"]
     assert finals and "meeting" in finals[-1][1]
+    assert finals[-1][2] == "vi"
 
 
 def test_endpoint_flushes_scheduler_residue_without_leak():

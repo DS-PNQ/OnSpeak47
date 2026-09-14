@@ -51,7 +51,7 @@ public class LanguageRouter {
         long now();
     }
 
-    private AsrLanguage active = AsrLanguage.VI;
+    private AsrLanguage active = AsrLanguage.UND;
     private float activeConfidence = 1.0f / 3;
     private AsrLanguage candidate;
     private long candidateSinceMs = -1;
@@ -96,7 +96,61 @@ public class LanguageRouter {
         this.active = lang == null ? AsrLanguage.UND : lang;
         this.activeConfidence = clamp01(confidence);
         clearCandidate();
+        state = active == AsrLanguage.UND ? RouterState.UNKNOWN : RouterState.ACTIVE;
+    }
+
+    /**
+     * fakedemo2 §22: bootstrap vs runtime paths are split. While no language
+     * is committed the router holds UNKNOWN — runtime hysteresis must not
+     * fire on bootstrap scores and vice versa.
+     */
+    public synchronized boolean isBootstrapping() {
+        return active == AsrLanguage.UND;
+    }
+
+    /**
+     * Commit the bootstrap decision (§22): first confident language for this
+     * utterance. Never called with UND — use {@link #reset} to go back to
+     * UNKNOWN between utterances.
+     */
+    public synchronized void commitBootstrap(AsrLanguage lang, float confidence) {
+        if (lang == null || lang == AsrLanguage.UND) return;
+        active = lang;
+        activeConfidence = clamp01(confidence);
+        clearCandidate();
         state = RouterState.ACTIVE;
+    }
+
+    /**
+     * Bootstrap gate (§22, §42): confident only when top1 >= 0.70 AND
+     * top1 - top2 >= 0.15. Anything else stays UNKNOWN — the pipeline then
+     * extends the window (§9 cách 1) or runs ≤2 speculative candidates (§32),
+     * never forcing VI on a bare max-probability.
+     *
+     * @return the committed language, or UND when still uncertain.
+     */
+    public synchronized AsrLanguage onBootstrapLidResult(LanguageIdEngine.LidResult lid) {
+        if (lid == null || lid.language == null || lid.language == AsrLanguage.UND) {
+            state = RouterState.BOOTSTRAPPING;
+            return AsrLanguage.UND;
+        }
+        if (active != AsrLanguage.UND) return active; // already bootstrapped
+        float top1 = lid.confidence;
+        float top2 = 0f;
+        if (lid.scores != null) {
+            for (Map.Entry<AsrLanguage, Float> e : lid.scores.entrySet()) {
+                if (e.getKey() == null || e.getKey() == lid.language
+                        || e.getKey() == AsrLanguage.UND || e.getValue() == null) continue;
+                top2 = Math.max(top2, e.getValue());
+            }
+        }
+        if (top1 >= AsrState.BOOTSTRAP_THRESHOLD
+                && (top1 - top2) >= AsrState.BOOTSTRAP_MARGIN) {
+            commitBootstrap(lid.language, top1);
+            return active;
+        }
+        state = RouterState.BOOTSTRAPPING;
+        return AsrLanguage.UND;
     }
 
     public synchronized AsrLanguage active() {
@@ -128,6 +182,10 @@ public class LanguageRouter {
      */
     public synchronized Decision onLidResult(LanguageIdEngine.LidResult lid) {
         if (lid == null || lid.language == null) return Decision.HOLD;
+        // Bootstrap owns the UND phase (§23): runtime hysteresis must not
+        // vote while no active model exists. The pipeline routes bootstrap
+        // scores through onBootstrapLidResult() instead.
+        if (active == AsrLanguage.UND) return Decision.HOLD;
         AsrLanguage cand = lid.language;
         if (cand == active || cand == AsrLanguage.UND) {
             clearCandidate();
@@ -246,10 +304,10 @@ public class LanguageRouter {
     }
 
     public synchronized void reset() {
-        active = AsrLanguage.VI;
+        active = AsrLanguage.UND;
         activeConfidence = 1.0f / 3;
         clearCandidate();
-        state = RouterState.ACTIVE;
+        state = RouterState.UNKNOWN;
         switchCount = 0;
         lastSwitchMs = -1;
         lastDiscarded = null;

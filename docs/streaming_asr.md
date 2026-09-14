@@ -38,6 +38,20 @@ Streaming Zipformer is the production ASR path (Whisper removed in
   switch needs `> 0.72`, `> active + 0.20`, persistent 200 ms (spec §12).
 - Rollback 640 ms default (up to 960), candidate-only shadow decode, 1500 ms
   cooldown after a rejected candidate (avoids decode storms on stuck LID).
+- Every utterance starts UNKNOWN: bootstrap acoustic LID commits the first
+  model from 200–300 ms of audio (`0.90·acoustic + 0.10·prior`, gate `0.70` /
+  margin `0.15`), then the buffered audio is replayed into the winner — no
+  VI default, no transcript circularity. Uncertain → one window extension,
+  then a one-shot ≤2-model speculative decode (800 ms cooldown, rotating
+  pair so the 3rd language is tried next pass; endpoint also tries the
+  leftover).
+- Option A provisional decode: while UNKNOWN the pipeline ALSO decodes
+  continuously on resident VI for live SPECULATIVE partials (~160 ms, never
+  committed). Same-language commit adopts the live stream (no replay);
+  other-language commit discards the provisional text and replays into the
+  winner. Endpoint while UNKNOWN flushes the provisional residue, then falls
+  back to pair + leftover + full-utterance verification with the provisional
+  hypothesis as base — utterances never get stuck with zero output.
 - Endpoint switches use a lower bar (`0.60`, margin `0.10`): boundaries
   rewrite nothing and spend no rollback decode (spec §13.1).
 - Endpoint candidate verification: at each VAD endpoint (2000 ms silence,
@@ -58,18 +72,36 @@ Streaming Zipformer is the production ASR path (Whisper removed in
 
 ## Roadmap — acoustic LID / Option C (intra-utterance switching)
 
-Status: NOT started. Endpoint verification above solves whole-utterance
-switches; intra-utterance code-switch ("Hôm nay tôi có meeting với team")
-still needs a real acoustic signal — no text-only path can observe a
-language the active decoder mangles.
+Status: BOOTSTRAP LANDED (fakedemo2). Endpoint verification below is now the
+inter-utterance backstop; every utterance starts UNKNOWN and the first model
+is committed by audio-only bootstrap LID:
+
+- `AcousticLidEngine` (+ interim `HeuristicAcousticLidEngine`: prosodic
+  time-domain cues, deliberately uncertain — capped below the 0.70 bar so it
+  can never force a language; swap for the trained tiny classifier without
+  touching callers).
+- `LanguageIdEngine.classifyBootstrap`: `0.90·acoustic + 0.10·prior`, no
+  text/history/ASR-confidence; no-scorer fallback is flat (never VI-locked).
+- `LanguageRouter`: starts `UND`/`UNKNOWN`, `onBootstrapLidResult` gate
+  (`top1 ≥ 0.70` AND `top1−top2 ≥ 0.15`), runtime `onLidResult` holds while
+  bootstrapping; hysteresis/rollback/shadow-verification unchanged.
+- `StreamingPipeline`: no ASR while `UND`, buffered-audio replay into the
+  winner, `utteranceSeq` stale-result guard, ≤2 speculative candidates with
+  800 ms cooldown, per-utterance reset to UNKNOWN.
+- Python mirror (`backend/streaming_asr/`) + 33 `test_07` tests + `bench`
+  A–D green.
+
+Remaining device work:
 
 1. Research a small spoken-LID ONNX model covering vi/en/zh (target
    ≤50 MB, CPU, ≤30 ms per 480 ms window).
 2. Bundle it via `optimize/11_fetch_streaming_zipformer.py` (+ labels).
-3. Wire it as `LanguageIdEngine.setAcousticScorer` (hook already exists;
-   Python: the `acoustic_scorer` param) — no pipeline changes needed.
-4. Retune fusion weights on the §26 set and confirm the 0.72 intra gate is
-   reachable with no VI lock-in and no mono-language P95 regression.
+3. Wire it as `LanguageIdEngine.setAcousticScorer` / `setAcousticLidEngine`
+   (hook already exists; Python: the `acoustic_scorer` param) — no pipeline
+   changes needed.
+4. Retune fusion weights on the §26 set (see `RUNTIME_W_*` starting points
+   in `AsrState`/`config.py`) and confirm the 0.72 intra gate is reachable
+   with no VI lock-in and no mono-language P95 regression.
 5. Acceptance: intra-utterance VI→EN switch <1.5 s audio-time; ZH whole
    utterances detected without CJK text evidence.
 - Transcript tiers SPECULATIVE → STABLE (N=2 survival) → FINAL (spec §18).

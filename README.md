@@ -52,7 +52,7 @@ OnSpeak47/
 │   ├── test_02_translation.py # Hy-MT translation scoring
 │   ├── test_04_vizh_corpus.py # Large-corpus VI↔ZH evaluation
 │   ├── test_05_pipeline.py    # Streaming-final → Translation → TTS tests
-│   ├── test_07_streaming_asr.py # Streaming ASR state-machine gate (22 tests)
+│   ├── test_07_streaming_asr.py # Streaming ASR state-machine gate (36 tests)
 │   ├── baselines/             # Recorded regression baseline (auto-created)
 │   ├── output/                # Latest gate/parity results (JSON)
 │   └── data/
@@ -247,29 +247,74 @@ adb logcat -s HyMtGgufJNI TranslationModule PipelineOrchestrator StreamingPipeli
 
 ## Known Issues & Limitations (streaming ASR)
 
-Device-validated unless noted; logic gates (`test_07`, bench A–D) green.
+Device-validated unless noted; logic gates (`test_07`, 36 tests, bench A–D) green.
 
-1. **Vietnamese-first assumption, no acoustic LID yet.** Every session
-   starts on the VI decoder; intra-utterance switching needs LID > 0.72 +
-   margin + shadow verification, which the flat text/acoustic priors cannot
-   reach without a real acoustic model — so English spoken mid-session is
-   first transcribed as VI garbage (`HELLO` → `HEO`) and only
-   whole-utterance switches are recovered at endpoints (text-aware
-   verification). Intra-utterance code-switch and reliable ZH detection
-   need a bundled acoustic LID model (roadmap in `docs/streaming_asr.md`).
-2. **Endpoint trade-off (2000 ms silence).** Natural pauses no longer split
+1. **UNKNOWN loop without an acoustic LID model (open, root cause known).**
+   Every utterance starts `UND` and bootstrap LID must commit from audio
+   alone — but the interim heuristic is capped below the 0.70 gate by
+   design, so all traffic falls into the dual-candidate fallback. That
+   fallback decodes a **cold 400 ms window with no drain decodes**, which on
+   the real streaming Zipformer almost always yields empty hypotheses →
+   `speculative candidates inconclusive, staying UNKNOWN` repeats, endpoint
+   finalizes empty, and full English sentences produce no output (only
+   dictionary-strong tokens like `HELLO` escape via the single-unit lexical
+   exception). Landed mitigations (in this tree, device retest pending):
+   provisional VI speculative decode while UNKNOWN with adopt-or-rollback on
+   commit, rotating candidate pairs, endpoint backstop (pair → leftover →
+   full-utterance verification). Remaining plan: feed candidates up to ~2 s
+   of left-context + drain loop, then retune the 0.35/0.30/0.50 bars down
+   (gated by the anti-garbage tests). A trained tiny LID remains the real
+   fix (roadmap in `docs/streaming_asr.md`).
+2. **sherpa `GetFrames` race → native crash (open, fix planned).** Observed
+   once after long use: `features.cc:GetFrames:188 / 6208 + 45 > 6248`
+   (fatal, uncatchable) → `Channel is unrecoverably broken` → process death.
+   Cause: `OnlineStream` is not thread-safe, but the audio thread
+   (`decodeChunk`/`decodeProvisional`/endpoint) and the LID worker
+   (`onCommitted`/`activateBootstrap`/`verifyCandidate`) touch the shared
+   resident engines concurrently. Planned fix: serialize all engine access
+   behind one lock (no thread-architecture change). Not observed in the
+   16:46 session below (clean stop, no `GetFrames` warning).
+3. **Full-English accuracy still weak (open).** Short EN works through the VI
+   model (`YOU` @0.47 → translated `BẠN.`), but fluent EN sentences end
+   UNKNOWN/empty per (1). Same remediation as (1).
+4. **Endpoint trade-off (2000 ms silence).** Natural pauses no longer split
    sentences, but hands-free finals arrive ~2 s after speech stops (plus
    translation). Tapping Stop flushes immediately.
-3. **sherpa/ORT version lockstep.** The app pins sherpa-onnx v1.13.4
+5. **sherpa/ORT version lockstep.** The app pins sherpa-onnx v1.13.4
    (vendored `android/app/libs/*.aar`, gitignored) with
    onnxruntime-android 1.27.0. Both ship `libonnxruntime.so` with ELF
    versioned symbols — bumping either side alone crashes at startup
    (`cannot locate symbol OrtGetApiBase`). Related rule: never decode
    without `isReadyToDecode()` — sherpa aborts the whole process on an
    under-buffered decode (no exception is thrown).
-4. **Memory.** Full stack (VI+EN+ZH + HyMT + TTS) measures ~1.3 GB PSS on
-   an 8 GB device; the 6 GB / 4 GB lazy buckets are designed but less
-   validated on-device.
-5. **Upstream caveat.** ORT 1.27.0 is reported to miscompute the zipformer2
+6. **Memory & startup.** Full stack (VI+EN+ZH + HyMT + TTS) measures
+   ~1.35 GB PSS, stable across sessions (no leak observed); the 6 GB / 4 GB
+   lazy buckets are designed but less validated on-device. Cold start loads
+   the three Zipformer recognizers sequentially (~2.6 s VI→EN→ZH on-device),
+   covered by the `LoadingActivity` screen.
+7. **Metrics caveat.** `utterances` counts VAD endpoints *including* empty
+   UND finals, so it overstates successfully decoded utterances; pair it
+   with non-empty FINAL logs when measuring. `partial_p50 ≈ 160 ms`
+   (meets targets) only reflects committed-stream partials.
+8. **No ZH TTS asset** (unchanged) — see note under Required assets above;
+   `No bundled MMS-TTS asset for [zh]` in logcat is expected, system TTS
+   covers Chinese.
+9. **Upstream caveat.** ORT 1.27.0 is reported to miscompute the zipformer2
    int8 encoder on Snapdragon 8 Elite Gen 5 (k2-fsa/sherpa-onnx#3845);
    fixed upstream in 1.28.0, which no sherpa Android release bundles yet.
+
+### Field-log notes 2026-09-14 (build pid 485, OnePlus/Oppo device)
+
+- Session starts `active=UND`, Silero VAD loads natively in ms, models
+  resident (`>=8GB: VI+EN+ZH`), TTS published for vi/en, zh falls back to
+  system TTS — all as designed.
+- The UNKNOWN loop in this log comes from a **pre-fix APK**: no
+  `provisional`/`bootstrap adopted` lines exist (the Option-A provisional
+  decode in this tree had not been built yet) — retest with a fresh APK
+  before concluding anything about current code.
+- Safe to ignore in logcat: `Oplus*` / `PopupWindow` / `HWUI` /
+  `SchedAssist open sharedFd Permission denied` / `AppOps attributionTag
+  not declared` / `predictive settings is disabled` / `unregisterSystemUI…
+  Receiver not registered` — OEM framework and system_server noise, not app
+  faults. Useful filters stay: `StreamingPipeline AsrMetrics
+  PipelineOrchestrator TranslationModule HyMtGgufJNI TTSModule`.

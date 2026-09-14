@@ -72,6 +72,9 @@ class ZipformerModelManager:
         return [self.get(l) for l in langs]
 
     def get(self, lang: str) -> FakeEngine:
+        # §13: "und" is "no language yet", never a model slot.
+        if not lang or lang == "und":
+            raise ValueError("no engine for 'und' (bootstrap first)")
         if lang not in self._resident:
             self._resident[lang] = self.factory(lang)
         return self._resident[lang]

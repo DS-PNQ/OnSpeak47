@@ -17,6 +17,23 @@ W_TEXT = 0.30
 W_CONFIDENCE = 0.15
 W_HISTORY = 0.10
 
+# --- Bootstrap acoustic LID (fakedemo2 §7-§8, §17): audio-only, never the
+# active-ASR transcript. Thresholds are starting points for tuning.
+BOOTSTRAP_MIN_MS = 200
+BOOTSTRAP_LID_WINDOW_MS = 300
+BOOTSTRAP_MAX_MS = 400
+BOOTSTRAP_THRESHOLD = 0.70
+BOOTSTRAP_MARGIN = 0.15
+BOOTSTRAP_W_ACOUSTIC = 0.90
+BOOTSTRAP_W_PRIOR = 0.10
+
+# --- Runtime LID weights (fakedemo2 §18, starting point; W_* above stay
+# authoritative until retuned against the real acoustic scorer).
+RUNTIME_W_ACOUSTIC = 0.65
+RUNTIME_W_TEXT = 0.20
+RUNTIME_W_CONFIDENCE = 0.05
+RUNTIME_W_HISTORY = 0.10
+
 SWITCH_THRESHOLD = 0.72
 SWITCH_MARGIN = 0.20
 SWITCH_PERSIST_MS = 200

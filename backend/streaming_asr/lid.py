@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from .config import (
     W_ACOUSTIC, W_TEXT, W_CONFIDENCE, W_HISTORY, EMA_ALPHA,
     LID_INTERVAL_STABLE_MS, LID_INTERVAL_UNCERTAIN_MS,
+    BOOTSTRAP_W_ACOUSTIC, BOOTSTRAP_W_PRIOR,
 )
 
 LANGS = ("vi", "en", "zh")
@@ -98,6 +99,81 @@ class LidResult:
     scores: dict = field(default_factory=dict)
 
 
+def _voiced_ratio(samples) -> float:
+    """Fraction of 20 ms frames with strong voicing (autocorrelation F0)."""
+    frame = 16000 * 20 // 1000
+    voiced = total = 0
+    n = len(samples)
+    for start in range(0, n - frame + 1, frame):
+        total += 1
+        seg = samples[start:start + frame]
+        e0 = sum(s * s for s in seg)
+        if e0 < 1e-6:
+            continue
+        best = 0.0
+        for lag in range(40, 201, 4):
+            if start + lag + frame > n:
+                break
+            corr = sum(seg[i] * samples[start + i + lag]
+                       for i in range(frame - lag))
+            e1 = sum(samples[start + i + lag] ** 2 for i in range(frame - lag))
+            denom = (e0 * e1) ** 0.5
+            if denom > 0:
+                best = max(best, corr / denom)
+        if best > 0.45:
+            voiced += 1
+    return voiced / total if total else 0.5
+
+
+def _sibilant_ratio(samples) -> float:
+    """Fraction of frames dominated by zero-crossings (frication)."""
+    frame = 16000 * 20 // 1000
+    sib = total = 0
+    for start in range(0, len(samples) - frame + 1, frame):
+        total += 1
+        seg = samples[start:start + frame]
+        zc = sum(1 for i in range(1, frame)
+                 if (seg[i] >= 0) != (seg[i - 1] >= 0))
+        rms = (sum(s * s for s in seg) / frame) ** 0.5
+        if zc / frame > 0.28 and rms > 0.015:
+            sib += 1
+    return sib / total if total else 0.0
+
+
+def heuristic_acoustic_scorer(audio) -> dict:
+    """Interim audio-derived LID (mirrors HeuristicAcousticLidEngine).
+
+    Prosodic time-domain cues only; deliberately UNCERTAIN by design (top
+    capped at 0.58, below the 0.70 bootstrap bar) so utterances fall through
+    to the dual-candidate path instead of being forced into VI. Swap for the
+    trained tiny classifier (§33) without touching callers.
+    """
+    if not audio or len(audio) < 16000 // 10:
+        return {"vi": 1.0 / 3, "en": 1.0 / 3, "zh": 1.0 / 3}
+    # Silence carries no language information: score flat instead of letting
+    # a voicing bias vote on near-zero audio (e.g. an endpoint window that is
+    # mostly trailing silence).
+    energy = (sum(s * s for s in audio) / len(audio)) ** 0.5
+    if energy < 0.008:
+        return {"vi": 1.0 / 3, "en": 1.0 / 3, "zh": 1.0 / 3}
+    voiced = _voiced_ratio(list(audio))
+    sib = _sibilant_ratio(list(audio))
+    vi = 1.0 + 0.35 * (voiced - 0.5) - 0.30 * sib
+    en = 1.0 - 0.25 * (voiced - 0.5) + 0.35 * sib
+    zh = 1.0 + 0.18 * (voiced - 0.5) - 0.10 * sib
+    s = vi + en + zh
+    out = {"vi": vi / s, "en": en / s, "zh": zh / s}
+    top = max(out.values())
+    if top > 0.58:
+        winner = max(out, key=lambda k: out[k])
+        excess = top - 0.58
+        out[winner] = 0.58
+        for k in out:
+            if k != winner:
+                out[k] += excess / 2
+    return out
+
+
 class LanguageIdEngine:
     """Cheap text-evidence LID with EMA smoothing (acoustic hook optional)."""
 
@@ -137,6 +213,38 @@ class LanguageIdEngine:
             "vi": 0.425 - 0.35 * cjk,
             "en": 0.425 - 0.35 * cjk,
         })
+
+    def _acoustic_audio_only(self, audio) -> dict:
+        """Audio-only scores for BOOTSTRAP (§17, §19): never the transcript.
+
+        With no scorer this returns a flat prior (UNCERTAIN → extend window
+        / dual-candidate) instead of the text-derived fallback — CJK == 0
+        must not rule out ZH before any transcript exists.
+        """
+        if self.acoustic_scorer is not None and audio:
+            try:
+                s = self.acoustic_scorer(audio)
+                if s:
+                    return _normalize({l: max(0.0, min(1.0, s.get(l, 1 / 3)))
+                                       for l in LANGS})
+            except Exception:
+                pass
+        return {l: 1.0 / 3 for l in LANGS}
+
+    def classify_bootstrap(self, audio) -> LidResult:
+        """Bootstrap classification (fakedemo2 §17): audio PRIMARY.
+
+        bootstrapScore = 0.90 * acoustic + 0.10 * uniform prior. Text,
+        history and ASR confidence are disabled; side-effect free (must not
+        drift runtime history/EMA).
+        """
+        if not audio:
+            return LidResult("und", 0.0, {l: 1.0 / 3 for l in LANGS})
+        acoustic = self._acoustic_audio_only(audio)
+        fused = _normalize({l: BOOTSTRAP_W_ACOUSTIC * acoustic[l]
+                            + BOOTSTRAP_W_PRIOR * (1.0 / 3) for l in LANGS})
+        best = max(LANGS, key=lambda l: fused[l])
+        return LidResult(best, fused[best], dict(fused))
 
     def classify(self, audio, partial_text: str, token_conf: float, active: str) -> LidResult:
         acoustic = self._acoustic(audio, partial_text)

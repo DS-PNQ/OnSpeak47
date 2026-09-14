@@ -10,10 +10,15 @@ from .config import (
     SWITCH_MARGIN, SWITCH_PERSIST_MS, ENDPOINT_THRESHOLD, ENDPOINT_MARGIN,
     ROLLBACK_MIN_MS, ROLLBACK_MAX_MS,
     ROLLBACK_DEFAULT_MS, TOKEN_STABLE_UPDATES, EMA_ALPHA,
+    BOOTSTRAP_MIN_MS, BOOTSTRAP_LID_WINDOW_MS, BOOTSTRAP_MAX_MS,
+    BOOTSTRAP_THRESHOLD, BOOTSTRAP_MARGIN,
+    BOOTSTRAP_W_ACOUSTIC, BOOTSTRAP_W_PRIOR,
+    RUNTIME_W_ACOUSTIC, RUNTIME_W_TEXT,
+    RUNTIME_W_CONFIDENCE, RUNTIME_W_HISTORY,
 )
 from .ring_buffer import AudioRingBuffer
 from .vad import VadEngine, VadResult
-from .lid import LanguageIdEngine, LidResult
+from .lid import LanguageIdEngine, LidResult, heuristic_acoustic_scorer
 from .router import LanguageRouter, RouterState
 from .partial import PartialTranscriptManager
 from .rollback import RollbackManager
@@ -27,7 +32,13 @@ __all__ = [
     "SWITCH_MARGIN", "SWITCH_PERSIST_MS", "ENDPOINT_THRESHOLD", "ENDPOINT_MARGIN",
     "ROLLBACK_MIN_MS", "ROLLBACK_MAX_MS",
     "ROLLBACK_DEFAULT_MS", "TOKEN_STABLE_UPDATES", "EMA_ALPHA",
+    "BOOTSTRAP_MIN_MS", "BOOTSTRAP_LID_WINDOW_MS", "BOOTSTRAP_MAX_MS",
+    "BOOTSTRAP_THRESHOLD", "BOOTSTRAP_MARGIN",
+    "BOOTSTRAP_W_ACOUSTIC", "BOOTSTRAP_W_PRIOR",
+    "RUNTIME_W_ACOUSTIC", "RUNTIME_W_TEXT",
+    "RUNTIME_W_CONFIDENCE", "RUNTIME_W_HISTORY",
     "AudioRingBuffer", "VadEngine", "VadResult", "LanguageIdEngine", "LidResult",
+    "heuristic_acoustic_scorer",
     "LanguageRouter", "RouterState", "PartialTranscriptManager", "RollbackManager",
     "AsrMetrics", "ZipformerModelManager", "FakeEngine", "StreamingAsrEngine",
     "StreamingPipeline",

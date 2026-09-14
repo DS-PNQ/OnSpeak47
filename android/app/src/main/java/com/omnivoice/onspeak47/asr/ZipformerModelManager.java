@@ -95,6 +95,11 @@ public class ZipformerModelManager {
 
     /** Get (creating + caching on first use) the engine for a language. */
     public synchronized StreamingAsrEngine get(AsrLanguage lang) {
+        // §13: UND is "no language yet", never a model slot. Fail fast so a
+        // caller bug can't silently decode on a null-asset engine.
+        if (lang == null || lang == AsrLanguage.UND) {
+            throw new IllegalArgumentException("no engine for UND (bootstrap first)");
+        }
         return ensure(lang);
     }
 

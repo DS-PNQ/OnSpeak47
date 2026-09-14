@@ -41,6 +41,20 @@ public class StreamingAsrUnitTest {
     }
 
     @Test
+    public void ringBuffer_sinceReplaysFromUtteranceStart() {
+        AudioRingBuffer ring = AudioRingBuffer.withCapacityMs(30_000);
+        ring.append(new float[1600]); // silence prefix
+        long start = ring.totalWritten();
+        float[] speech = new float[3200];
+        for (int i = 0; i < speech.length; i++) speech[i] = 0.2f;
+        ring.append(speech);
+        ring.append(new float[32000]); // trailing silence (endpoint delay)
+        float[] replay = ring.since(start, AsrState.SAMPLE_RATE * 6);
+        assertEquals(3200 + 32000, replay.length);
+        assertEquals(0.2f, replay[0], 1e-6f);
+    }
+
+    @Test
     public void rollback_defaultsTo640ms() {
         AudioRingBuffer ring = AudioRingBuffer.withCapacityMs(30_000);
         float[] twoSec = new float[AsrState.SAMPLE_RATE * 2];
@@ -57,6 +71,58 @@ public class StreamingAsrUnitTest {
     private static LanguageRouter testRouter(AtomicLong now) {
         return new LanguageRouter(AsrState.SWITCH_THRESHOLD, AsrState.SWITCH_MARGIN,
                 AsrState.SWITCH_PERSIST_MS, now::get);
+    }
+
+    @Test
+    public void router_startsUnknownNeverVi() {
+        // fakedemo2 §6: never ACTIVE+VI at start — UNKNOWN until bootstrap.
+        LanguageRouter router = testRouter(new AtomicLong(0));
+        assertEquals(AsrLanguage.UND, router.active());
+        assertTrue(router.isBootstrapping());
+        assertEquals(RouterState.UNKNOWN, router.state());
+        router.reset();
+        assertEquals(AsrLanguage.UND, router.active());
+    }
+
+    @Test
+    public void router_runtimeGateHoldsWhileBootstrapping() {
+        LanguageRouter router = testRouter(new AtomicLong(0));
+        // Even a 0.95 candidate must not fire runtime hysteresis pre-bootstrap.
+        assertEquals(LanguageRouter.Decision.HOLD,
+                router.onLidResult(lid(AsrLanguage.EN, 0.95f)));
+    }
+
+    @Test
+    public void router_bootstrapGateConfidentVsUncertain() {
+        LanguageRouter router = testRouter(new AtomicLong(0));
+        // Confident VI (0.82, margin 0.69) commits.
+        Map<AsrLanguage, Float> confident = new EnumMap<>(AsrLanguage.class);
+        confident.put(AsrLanguage.VI, 0.82f);
+        confident.put(AsrLanguage.EN, 0.13f);
+        confident.put(AsrLanguage.ZH, 0.05f);
+        assertEquals(AsrLanguage.VI, router.onBootstrapLidResult(
+                new LanguageIdEngine.LidResult(AsrLanguage.VI, 0.82f, confident)));
+        assertEquals(AsrLanguage.VI, router.active());
+        assertTrue(!router.isBootstrapping());
+
+        // VI 0.46 / EN 0.43 must NOT force VI on max-probability (§8).
+        router.reset();
+        Map<AsrLanguage, Float> tie = new EnumMap<>(AsrLanguage.class);
+        tie.put(AsrLanguage.VI, 0.46f);
+        tie.put(AsrLanguage.EN, 0.43f);
+        tie.put(AsrLanguage.ZH, 0.11f);
+        assertEquals(AsrLanguage.UND, router.onBootstrapLidResult(
+                new LanguageIdEngine.LidResult(AsrLanguage.VI, 0.46f, tie)));
+        assertEquals(AsrLanguage.UND, router.active());
+    }
+
+    @Test
+    public void router_commitBootstrapRejectsUnd() {
+        LanguageRouter router = testRouter(new AtomicLong(0));
+        router.commitBootstrap(AsrLanguage.UND, 0.9f);
+        assertEquals(AsrLanguage.UND, router.active());
+        router.commitBootstrap(AsrLanguage.EN, 0.8f);
+        assertEquals(AsrLanguage.EN, router.active());
     }
 
     private static LanguageIdEngine.LidResult lid(AsrLanguage lang, float conf) {
@@ -217,5 +283,54 @@ public class StreamingAsrUnitTest {
     public void lid_intervalAdaptive() {
         assertEquals(600, LanguageIdEngine.lidIntervalMs(false));
         assertEquals(400, LanguageIdEngine.lidIntervalMs(true));
+    }
+
+    // --- Bootstrap acoustic LID (fakedemo2 §16–§17) -------------------------
+
+    @Test
+    public void bootstrap_usesAudioNotTranscript() {
+        // EN acoustic evidence wins even though no transcript exists yet —
+        // bootstrap never consults text (§17).
+        Map<AsrLanguage, Float> en = new EnumMap<>(AsrLanguage.class);
+        en.put(AsrLanguage.VI, 0.05f);
+        en.put(AsrLanguage.EN, 0.90f);
+        en.put(AsrLanguage.ZH, 0.05f);
+        LanguageIdEngine lid = new LanguageIdEngine((audio) -> en, AsrState.EMA_ALPHA);
+        LanguageIdEngine.LidResult r = lid.classifyBootstrap(new float[4800]);
+        assertEquals(AsrLanguage.EN, r.language);
+        assertTrue(r.confidence >= AsrState.BOOTSTRAP_THRESHOLD);
+    }
+
+    @Test
+    public void bootstrap_withoutScorerStaysFlatNeverViLocked() {
+        // No acoustic model: flat prior → router stays UNCERTAIN (extend /
+        // dual-candidate), never forced VI (§8, §19).
+        LanguageIdEngine lid = new LanguageIdEngine();
+        LanguageIdEngine.LidResult r = lid.classifyBootstrap(new float[4800]);
+        assertEquals(1.0f / 3, r.scores.get(AsrLanguage.VI), 1e-6f);
+        assertEquals(1.0f / 3, r.scores.get(AsrLanguage.EN), 1e-6f);
+        LanguageRouter router = testRouter(new AtomicLong(0));
+        assertEquals(AsrLanguage.UND, router.onBootstrapLidResult(r));
+    }
+
+    @Test
+    public void heuristicLid_isAudioDerivedAndNeverConfident() {
+        AcousticLidEngine h = new AcousticLidEngine.HeuristicAcousticLidEngine();
+        // Silence → flat.
+        Map<AsrLanguage, Float> silence = h.classify(new float[4800]);
+        assertEquals(1.0f / 3, silence.get(AsrLanguage.VI), 1e-6f);
+        // Voiced-like signal → leans tonal but stays below the commit bar.
+        float[] voiced = new float[4800];
+        for (int i = 0; i < voiced.length; i++) {
+            voiced[i] = (float) (0.3 * Math.sin(2 * Math.PI * 120 * i / 16000));
+        }
+        Map<AsrLanguage, Float> s = h.classify(voiced);
+        float top = Math.max(s.get(AsrLanguage.VI),
+                Math.max(s.get(AsrLanguage.EN), s.get(AsrLanguage.ZH)));
+        assertTrue(top <= 0.58f + 1e-6f);
+        assertTrue(top >= 1.0f / 3 - 1e-6f);
+        // Empty input → flat, never null.
+        assertTrue(h.classify(new float[0]) != null);
+        assertTrue(h.classify(null) != null);
     }
 }

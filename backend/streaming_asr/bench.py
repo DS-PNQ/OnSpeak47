@@ -45,13 +45,26 @@ def _partial_intervals_ms(p: StreamingPipeline) -> list:
 def scenario_a_mono() -> dict:
     now = [0]
     engines = {}
-    p = StreamingPipeline(clock=lambda: now[0],
-                          factory=lambda lang: engines.setdefault(lang, FakeEngine(lang)))
-    engines["vi"].inject_partial("xin chào mọi người", 0.9)
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        if lang == "vi":
+            # Hook-driven (survives the bootstrap replay reset): text appears
+            # only when audio was actually fed, like a real transducer.
+            e.decode_hook = lambda fed: ("xin chào mọi người", 0.9) if fed >= 1600 else ("", 0.5)
+        return e
+
+    def acoustic_vi(audio):
+        return {"vi": 0.9, "en": 0.05, "zh": 0.05}
+
+    p = StreamingPipeline(clock=lambda: now[0], factory=factory,
+                          acoustic_scorer=acoustic_vi)
     _run(p, now, 250, SPEECH)  # 5 s VI
     n = len(_partials(p))
+    langs = {e[3] for e in _partials(p)}
     return {"partials_5s": n, "expected_min": 25,
-            "ok": n >= 25, "utterances": p.metrics.utterances}
+            "ok": n >= 25 and langs == {"vi"}, "utterances": p.metrics.utterances}
 
 
 def scenario_b_inter_utterance() -> dict:
@@ -80,19 +93,21 @@ def scenario_b_inter_utterance() -> dict:
 
     p = StreamingPipeline(clock=lambda: now[0], factory=factory,
                           acoustic_scorer=acoustic)
+    final_langs = []
     for lang, text in (("vi", texts["vi"]), ("en", texts["en"]),
                        ("zh", texts["zh"])):
         current[0] = lang
-        # Live partials on the active engine; mismatched language decodes
-        # with low confidence (what a real transducer produces), which is
-        # what lets the endpoint verification tell them apart.
-        p.active_asr.inject_partial(text, 0.9 if lang == p.active_lang else 0.35)
+        # No manual inject: each engine decodes fluently only when fed its
+        # own language (decode hooks above), and bootstrap acoustic LID
+        # commits the right model from the audio at ~200 ms — the fakedemo2
+        # fix (no VI lock, no endpoint escape hatch needed).
         _run(p, now, 150, SPEECH)   # 3 s speech
         _run(p, now, 120, SILENCE)  # 2400 ms endpoint (2000 ms bar)
     finals = [e for e in p.events if e[0] == "final"]
+    final_langs = [f[2] for f in finals]
     return {"finals": len(finals), "expected_finals": 3,
-            "endpoint_switches": p.router.switch_count, "expected_switches": 2,
-            "ok": len(finals) == 3 and p.router.switch_count == 2}
+            "final_langs": final_langs, "expected_langs": ["vi", "en", "zh"],
+            "ok": len(finals) == 3 and final_langs == ["vi", "en", "zh"]}
 
 
 def scenario_c_intra_utterance() -> dict:
@@ -136,9 +151,19 @@ def scenario_c_intra_utterance() -> dict:
 def scenario_d_noisy_silence() -> dict:
     now = [0]
     engines = {}
-    p = StreamingPipeline(clock=lambda: now[0],
-                          factory=lambda lang: engines.setdefault(lang, FakeEngine(lang)))
-    engines["vi"].inject_partial("xin chào", 0.9)
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        if lang == "vi":
+            e.decode_hook = lambda fed: ("xin chào", 0.9) if fed >= 1600 else ("", 0.5)
+        return e
+
+    def acoustic_vi(audio):
+        return {"vi": 0.9, "en": 0.05, "zh": 0.05}
+
+    p = StreamingPipeline(clock=lambda: now[0], factory=factory,
+                          acoustic_scorer=acoustic_vi)
     _run(p, now, 50, [0.003] * 320)  # sub-threshold hum: VAD must suppress
     suppressed = len(_partials(p)) == 0
     _run(p, now, 50, SPEECH)         # real speech decodes

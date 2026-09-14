@@ -77,6 +77,11 @@ public class LanguageIdEngine {
         this.acousticScorer = scorer;
     }
 
+    /** Inject the bootstrap acoustic LID engine (fakedemo2 §16). */
+    public void setAcousticLidEngine(AcousticLidEngine engine) {
+        this.acousticScorer = engine == null ? null : new AcousticLidEngine.Adapter(engine);
+    }
+
     /**
      * Classify one window. Never blocks ASR — call from the LID worker.
      *
@@ -135,6 +140,45 @@ public class LanguageIdEngine {
         return new EnumMap<>(smoothed);
     }
 
+    /**
+     * Bootstrap classification (fakedemo2 §17): audio is PRIMARY, everything
+     * else is disabled. text = ignored (no transcript exists yet and any
+     * partial would come from a wrong-language decoder), history = neutral,
+     * ASR confidence = disabled.
+     *
+     * <pre>bootstrapScore = 0.90 * acoustic + 0.10 * uniform prior</pre>
+     *
+     * Deliberately side-effect free: bootstrap must not drift the runtime
+     * history/EMA. Returns UND with a flat score map when there is no audio
+     * (caller keeps collecting up to BOOTSTRAP_MAX_MS).
+     */
+    public synchronized LidResult classifyBootstrap(float[] audioWindow) {
+        if (audioWindow == null || audioWindow.length == 0) {
+            Map<AsrLanguage, Float> flat = new EnumMap<>(AsrLanguage.class);
+            flat.put(AsrLanguage.VI, 1.0f / 3);
+            flat.put(AsrLanguage.EN, 1.0f / 3);
+            flat.put(AsrLanguage.ZH, 1.0f / 3);
+            return new LidResult(AsrLanguage.UND, 0f, flat);
+        }
+        Map<AsrLanguage, Float> acoustic = acousticScoresAudioOnly(audioWindow);
+        Map<AsrLanguage, Float> fused = new EnumMap<>(AsrLanguage.class);
+        for (AsrLanguage l : new AsrLanguage[]{AsrLanguage.VI, AsrLanguage.EN, AsrLanguage.ZH}) {
+            float a = acoustic.getOrDefault(l, 1.0f / 3);
+            fused.put(l, AsrState.BOOTSTRAP_W_ACOUSTIC * a
+                    + AsrState.BOOTSTRAP_W_PRIOR * (1.0f / 3));
+        }
+        normalize(fused);
+        AsrLanguage best = AsrLanguage.UND;
+        float bestScore = -1;
+        for (Map.Entry<AsrLanguage, Float> e : fused.entrySet()) {
+            if (e.getValue() > bestScore) {
+                bestScore = e.getValue();
+                best = e.getKey();
+            }
+        }
+        return new LidResult(best, bestScore, new EnumMap<>(fused));
+    }
+
     private float tokenConfWeight(AsrLanguage lang, AsrLanguage active, float conf) {
         // Token confidence supports the *active* hypothesis; alternatives get
         // the complement. Keeps the 0.15 weight meaningful without a per-lang
@@ -169,6 +213,37 @@ public class LanguageIdEngine {
         out.put(AsrLanguage.EN, 0.425f - 0.35f * cjk);
         normalize(out);
         return out;
+    }
+
+    /**
+     * Audio-only acoustic scores for BOOTSTRAP (§17, §19). Unlike the runtime
+     * {@link #acousticScores} fallback above, this NEVER consults the
+     * transcript: with no scorer it returns a flat prior so the router stays
+     * UNCERTAIN (extend window / dual-candidate) instead of locking VI via
+     * text. In particular CJK == 0 must not rule out ZH here — at bootstrap
+     * there is no transcript to measure yet.
+     */
+    private Map<AsrLanguage, Float> acousticScoresAudioOnly(float[] audio) {
+        if (acousticScorer != null && audio != null && audio.length > 0) {
+            try {
+                Map<AsrLanguage, Float> s = acousticScorer.score(audio);
+                if (s != null && !s.isEmpty()) {
+                    Map<AsrLanguage, Float> out = new EnumMap<>(AsrLanguage.class);
+                    for (AsrLanguage l : new AsrLanguage[]{AsrLanguage.VI, AsrLanguage.EN, AsrLanguage.ZH}) {
+                        out.put(l, clamp01(s.getOrDefault(l, 1.0f / 3)));
+                    }
+                    normalize(out);
+                    return out;
+                }
+            } catch (Exception ignored) {
+                // Fall through to the flat prior.
+            }
+        }
+        Map<AsrLanguage, Float> flat = new EnumMap<>(AsrLanguage.class);
+        flat.put(AsrLanguage.VI, 1.0f / 3);
+        flat.put(AsrLanguage.EN, 1.0f / 3);
+        flat.put(AsrLanguage.ZH, 1.0f / 3);
+        return flat;
     }
 
     /** Cheap text evidence: CJK density (spec §16) + VI/EN lexicons (§17). */
