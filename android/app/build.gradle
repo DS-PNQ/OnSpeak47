@@ -1,5 +1,12 @@
 apply plugin: 'com.android.application'
 
+// Vendored native dependencies (sherpa-onnx AAR, see dependencies below).
+repositories {
+    flatDir {
+        dirs 'libs'
+    }
+}
+
 android {
     namespace 'com.omnivoice.onspeak47'
     compileSdkVersion 34
@@ -50,6 +57,15 @@ android {
         jniLibs {
             useLegacyPackaging = true
         }
+        // Both onnxruntime-android and the sherpa-onnx AAR ship their own
+        // libonnxruntime.so (ours 1.27.0, sherpa's ~1.27.x) for EVERY ABI they
+        // support. The ORT C API is backward compatible, so either copy loads;
+        // first-wins keeps the build green. If logcat ever shows
+        // UnsatisfiedLinkError in sherpa or ORT sessions, align both sides to
+        // one onnxruntime-android version instead.
+        pickFirst '**/libonnxruntime.so'
+        // Same story for the NDK C++ runtime both AARs bundle.
+        pickFirst '**/libc++_shared.so'
     }
     lint {
         abortOnError false
@@ -78,9 +94,28 @@ dependencies {
     implementation 'androidx.cardview:cardview:1.0.0'
     implementation 'androidx.recyclerview:recyclerview:1.3.2'
 
-    // ONNX Runtime for on-device model inference
-    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.22.0'
+    // ONNX Runtime for on-device model inference (TTS + Silero VAD).
+    // Version MUST stay in lockstep with the ORT core bundled inside the
+    // sherpa-onnx AAR (1.27.1 for sherpa v1.13.5; 1.27.0 is the closest on
+    // Maven Central). Both AARs ship libonnxruntime.so and packaging keeps
+    // only one copy — a skew (e.g. 1.22.0) crashes at startup with
+    // "cannot locate symbol OrtGetApiBase referenced by libsherpa-onnx-jni.so".
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.27.0'
     implementation 'com.microsoft.onnxruntime:onnxruntime-extensions-android:0.13.0'
+
+    // Realtime multilingual ASR: streaming Zipformer VI/EN/ZH via
+    // sherpa-onnx OnlineRecognizer (production path — models fetched via
+    // optimize/11_fetch_streaming_zipformer.py --all --stage-assets).
+    // Vendored as app/libs/sherpa-onnx-1.13.4.aar (gitignored, 46 MB — fetch
+    // from https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar).
+    // JitPack is NOT used: it never built v1.13.4, and v1.13.5+ bundles
+    // ORT 1.27.1 whose symbols match nothing on Maven Central.
+    // VERSION PINNED to v1.13.4: its Android prebuilt bundles ORT 1.27.0,
+    // exactly matching onnxruntime-android:1.27.0 below. Both AARs ship
+    // libonnxruntime.so with ELF versioned symbols (VERS_X.Y.Z) and Android's
+    // linker rejects any skew ("cannot locate symbol OrtGetApiBase").
+    // DO NOT bump either side alone — see k2-fsa/sherpa-onnx#3845.
+    implementation(name: 'sherpa-onnx-1.13.4', ext: 'aar')
 
     // NOTE: the former optional onnxruntime-genai AAR (fileTree libs) was
     // removed with the HIGH_END INT4 profile — translation is single-path

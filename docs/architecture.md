@@ -1,6 +1,11 @@
 # Omni Voice — Architecture Overview
 
-## Pipeline Design
+> **RETIRED (migrate/zipformer-only):** this document describes the original
+> Whisper + NLLB prototype. Production is now streaming Zipformer ASR
+> (VI/EN/ZH auto-router) → HyMT-1.5 GGUF → MMS-TTS — see `README.md` and
+> `docs/streaming_asr.md`. Kept for history only.
+
+## Pipeline Design (retired)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐

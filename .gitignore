@@ -9,6 +9,10 @@ onnx_models/
 *.gguf
 *.safetensors
 android/app/src/main/assets/hf_cache/
+# Vendored sherpa-onnx AAR (46 MB) — fetch, don't commit:
+# https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar
+# -> android/app/libs/
+android/app/libs/*.aar
 
 # Python
 .venv/

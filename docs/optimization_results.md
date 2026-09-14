@@ -1,5 +1,10 @@
 # OmniVoice — Runtime & RAM Optimization (target: wearable/edge ≤ 4 GB)
 
+> **RETIRED (migrate/zipformer-only):** Whisper/NLLB optimization log. Kept
+> for history — production ASR is now streaming Zipformer (see
+> `docs/streaming_asr.md`). Do not follow the Whisper export/quantize
+> commands below; those scripts were deleted.
+
 Ngày: 2026-08-17 · Branch: `fakedemo4` · Mọi thay đổi model đều đã qua parity gate
 (`tests_local/test_06_onnx_parity.py`, chạy bằng venv `onnxruntime==1.22.0` khớp app).
 

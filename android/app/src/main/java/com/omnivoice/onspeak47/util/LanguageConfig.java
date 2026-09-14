@@ -10,16 +10,17 @@ package com.omnivoice.onspeak47.util;
 /**
  * Language configuration for the three in-scope languages.
  *
- * Provides display names, ISO codes, NLLB FLORES-200 codes,
- * and Whisper language tokens — all in one place.
+ * Provides display names and ISO codes in one place. Source language is
+ * auto-detected by the streaming router (VI/EN/ZH) — the UI only selects
+ * the translation target.
  */
 public final class LanguageConfig {
 
     // Ordered list of supported languages
     private static final Language[] LANGUAGES = {
-            new Language("vi", "Tiếng Việt", "vie_Latn", "<|vi|>"),
-            new Language("en", "English", "eng_Latn", "<|en|>"),
-            new Language("zh", "中文 (简体)", "zho_Hans", "<|zh|>"),
+            new Language("vi", "Tiếng Việt"),
+            new Language("en", "English"),
+            new Language("zh", "中文 (简体)"),
     };
 
     private LanguageConfig() {}  // static utility class
@@ -54,26 +55,6 @@ public final class LanguageConfig {
     }
 
     /**
-     * Get the NLLB FLORES-200 code for an ISO code.
-     */
-    public static String getNllbCode(String code) {
-        for (Language lang : LANGUAGES) {
-            if (lang.code.equals(code)) return lang.nllbCode;
-        }
-        return "vie_Latn";
-    }
-
-    /**
-     * Get the Whisper language token for an ISO code.
-     */
-    public static String getWhisperToken(String code) {
-        for (Language lang : LANGUAGES) {
-            if (lang.code.equals(code)) return lang.whisperToken;
-        }
-        return "<|vi|>";
-    }
-
-    /**
      * Get the number of supported languages.
      */
     public static int count() {
@@ -87,14 +68,10 @@ public final class LanguageConfig {
     private static class Language {
         final String code;         // ISO 639-1 ("vi", "en", "zh")
         final String displayName;  // Human-readable name
-        final String nllbCode;     // NLLB FLORES-200 code
-        final String whisperToken; // Whisper language token
 
-        Language(String code, String displayName, String nllbCode, String whisperToken) {
+        Language(String code, String displayName) {
             this.code = code;
             this.displayName = displayName;
-            this.nllbCode = nllbCode;
-            this.whisperToken = whisperToken;
         }
     }
 }

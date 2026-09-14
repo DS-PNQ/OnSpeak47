@@ -13,27 +13,23 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
-import com.omnivoice.onspeak47.pipeline.ASRModule;
+import com.omnivoice.onspeak47.asr.ZipformerModelManager;
 import com.omnivoice.onspeak47.pipeline.PipelineOrchestrator;
 import com.omnivoice.onspeak47.pipeline.TTSModule;
 import com.omnivoice.onspeak47.pipeline.TranslationModule;
-import com.omnivoice.onspeak47.util.LanguageConfig;
 
 
 /**
- * Global Application class — manages the lifecycle of the three
- * pipeline models (Whisper, NLLB, MMS-TTS).
- *
- * Modeled after RTranslator-2.00's {@code Global.java} but scoped
- * to the VN↔EN/VN↔CN language pairs only.
+ * Global Application class — manages the lifecycle of the on-device models:
+ * streaming Zipformer ASR (VI/EN/ZH), HyMT translation (GGUF) and MMS-TTS.
  */
 public class OmniVoiceApp extends Application {
 
     private static final String TAG = "OmniVoiceApp";
 
-    @Nullable private ASRModule asrModule;
     @Nullable private TranslationModule translationModule;
     @Nullable private TTSModule ttsModule;
+    @Nullable private ZipformerModelManager streamingAsrModels;
     @Nullable private PipelineOrchestrator orchestrator;
 
     private Handler mainHandler;
@@ -54,26 +50,28 @@ public class OmniVoiceApp extends Application {
     // ----------------------------------------------------------------
 
     /**
-     * Initialize the ASR (Whisper) module.
+     * Preload streaming Zipformer models per the device RAM bucket
+     * (VI+EN+ZH on >=8GB, VI+EN on 6GB, VI on smaller devices).
      */
-    public void initializeASR(@NonNull InitListener listener) {
-        if (asrModule != null) {
+    public void initializeStreamingAsr(@NonNull InitListener listener) {
+        if (streamingAsrModels != null) {
             listener.onInitialized();
             return;
         }
         new Thread(() -> {
             try {
-                asrModule = new ASRModule(this);
+                streamingAsrModels = new ZipformerModelManager(this);
+                streamingAsrModels.preloadForDevice();
                 mainHandler.post(listener::onInitialized);
             } catch (Exception e) {
-                Log.e(TAG, "ASR init failed", e);
-                mainHandler.post(() -> listener.onError("ASR initialization failed: " + e.getMessage()));
+                Log.e(TAG, "Streaming ASR init failed", e);
+                mainHandler.post(() -> listener.onError("Streaming ASR init failed: " + e.getMessage()));
             }
         }).start();
     }
 
     /**
-     * Initialize the Translation (NLLB) module.
+     * Initialize the Translation (HyMT GGUF) module.
      */
     public void initializeTranslation(@NonNull InitListener listener) {
         if (translationModule != null) {
@@ -111,22 +109,24 @@ public class OmniVoiceApp extends Application {
     }
 
     /**
-     * Initialize all three modules in parallel and create the pipeline orchestrator.
-     * This significantly reduces startup time compared to sequential loading.
+     * Initialize streaming ASR + translation + TTS in parallel and create
+     * the pipeline orchestrator. This significantly reduces startup time
+     * compared to sequential loading.
      */
     public void initializeAll(@NonNull InitListener listener) {
         new Thread(() -> {
             java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(3);
             final String[] errors = new String[3];
 
-            // Load ASR in parallel
+            // Preload streaming ASR in parallel
             new Thread(() -> {
                 try {
-                    asrModule = new ASRModule(OmniVoiceApp.this);
-                    Log.i(TAG, "ASR module loaded");
+                    streamingAsrModels = new ZipformerModelManager(OmniVoiceApp.this);
+                    streamingAsrModels.preloadForDevice();
+                    Log.i(TAG, "Streaming ASR models loaded");
                 } catch (Exception e) {
-                    Log.e(TAG, "ASR init failed", e);
-                    errors[0] = "ASR initialization failed: " + e.getMessage();
+                    Log.e(TAG, "Streaming ASR init failed", e);
+                    errors[0] = "Streaming ASR init failed: " + e.getMessage();
                 } finally {
                     latch.countDown();
                 }
@@ -175,7 +175,7 @@ public class OmniVoiceApp extends Application {
             }
 
             // All loaded successfully — create orchestrator
-            orchestrator = new PipelineOrchestrator(asrModule, translationModule, ttsModule);
+            orchestrator = new PipelineOrchestrator(translationModule, ttsModule);
             mainHandler.post(listener::onInitialized);
         }).start();
     }
@@ -184,8 +184,8 @@ public class OmniVoiceApp extends Application {
      * Create orchestrator instance if modules are initialized.
      */
     public void createOrchestrator() {
-        if (asrModule != null && translationModule != null && ttsModule != null) {
-            orchestrator = new PipelineOrchestrator(asrModule, translationModule, ttsModule);
+        if (translationModule != null && ttsModule != null) {
+            orchestrator = new PipelineOrchestrator(translationModule, ttsModule);
         }
     }
 
@@ -193,7 +193,7 @@ public class OmniVoiceApp extends Application {
     // Getters
     // ----------------------------------------------------------------
 
-    @Nullable public ASRModule getASRModule() { return asrModule; }
+    @Nullable public ZipformerModelManager getStreamingAsrModels() { return streamingAsrModels; }
     @Nullable public TranslationModule getTranslationModule() { return translationModule; }
     @Nullable public TTSModule getTTSModule() { return ttsModule; }
     @Nullable public PipelineOrchestrator getOrchestrator() { return orchestrator; }

@@ -6,12 +6,13 @@
     <!-- Loading screen -->
     <string name="loading_models">Initializing translation models…</string>
 
-    <!-- Translation screen -->
-    <string name="label_transcript">Transcript</string>
+    <!-- Translation screen (streaming toggle) -->
+    <string name="label_transcript">Transcript (auto VI/EN/ZH)</string>
     <string name="label_translation">Translation</string>
-    <string name="hint_speak">Press and hold the button to speak…</string>
-    <string name="btn_talk">🎤  Hold to Speak</string>
-    <string name="btn_recording">🔴  Recording…</string>
+    <string name="hint_speak">Nhấn Bắt đầu để nói…</string>
+    <string name="btn_talk">🎤  Bắt đầu</string>
+    <string name="btn_start">🎤  Bắt đầu</string>
+    <string name="btn_stop">⏹  Dừng</string>
     <string name="no_speech">No speech detected</string>
 
     <!-- Languages -->

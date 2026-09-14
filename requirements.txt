@@ -5,23 +5,30 @@
 torch>=2.2
 transformers>=4.42
 llama-cpp-python>=0.3.9    # Hy-MT low-RAM profile: 1.25-bit STQ GGUF (llama.cpp + STQ kernel)
-onnxruntime-genai>=1.22.0  # Hy-MT high-end profile: INT4 ONNX via ONNX Runtime GenAI
+# NOTE: real PyPI versions are 0.x (upstream stopped publishing Python wheels
+# after 0.11.x; newer releases ship native libs/AARs on GitHub only). The 08_
+# export script auto-fetches the pinned upstream builder source for Hunyuan.
+onnxruntime-genai==0.11.4  # Hy-MT high-end profile: INT4 ONNX via ONNX Runtime GenAI
 sentencepiece>=0.1.99   # MMS-TTS tokenizer / legacy tooling
 protobuf>=3.20          # needed for some slow-tokenizer conversions (sentencepiece path)
 accelerate>=0.30        # smoother device_map / low-mem model loading in transformers
-soundfile>=0.12         # audio-file decode backend used by librosa.load (ASR input)
-librosa>=0.10           # resample arbitrary input audio to Whisper's required 16kHz
+soundfile>=0.12         # audio-file decode backend for test fixtures
+librosa>=0.10           # resample test audio to the 16kHz streaming frontend
 scipy>=1.11             # writing MMS-TTS waveform output to disk
 numpy>=1.26
 jiwer>=3.0               # WER/CER scoring for ASR accuracy tests
 sacrebleu>=2.4           # BLEU scoring for translation quality tests
 pytest>=8.0              # test runner for tests_local/
+requests>=2.31          # model-asset downloads (optimize/07_prepare_hymt_gguf.py, 11_fetch_*.py)
+huggingface_hub>=0.20   # HF Hub downloads with resume/cache (same scripts)
 
 # --- ONNX export / Qualcomm AI Hub (optimize/) — only needed for the export/quantize scripts ---
-optimum>=1.20
+# NOTE: the [onnxruntime] extra is required — plain `optimum` no longer ships
+# optimum.onnxruntime (split into a separate package since optimum v2).
+optimum[onnxruntime]>=1.20
 onnx>=1.16
+onnx_ir>=0.1           # ORT GenAI model builder dependency (not pulled by the 0.11.x wheel)
 onnxruntime>=1.18
-onnxruntime-extensions>=0.13  # tokenizer graph emission in 01_export_onnx.py
 qai-hub                      # Qualcomm AI Hub SDK (requires API token)
 
 # --- Linux-only optionals ---

@@ -32,13 +32,6 @@ def translator():
 
 
 @pytest.fixture(scope="session")
-def asr_model():
-    from backend.asr_whisper import WhisperASR
-
-    return WhisperASR()
-
-
-@pytest.fixture(scope="session")
 def tts_model():
     from backend.tts_mms import MMSTTS
 
@@ -46,10 +39,10 @@ def tts_model():
 
 
 @pytest.fixture(scope="session")
-def pipeline(asr_model, translator, tts_model):
+def pipeline(translator, tts_model):
     from backend.orchestrator import OmniVoicePipeline
 
-    return OmniVoicePipeline(asr=asr_model, translator=translator, tts=tts_model)
+    return OmniVoicePipeline(translator=translator, tts=tts_model)
 
 
 # ==================================================================

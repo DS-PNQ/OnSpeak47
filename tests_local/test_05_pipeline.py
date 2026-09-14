@@ -1,18 +1,18 @@
-# End-to-end pipeline tests
+# End-to-end pipeline tests (streaming-first).
 #
-# Verifies the full OmniVoicePipeline: ASR → Translation → TTS.
+# Verifies OmniVoicePipeline on streaming FINAL transcripts:
+# Translation → TTS. ASR accuracy itself is covered by
+# tests_local/test_07_streaming_asr.py (no models/network needed).
 
 from pathlib import Path
 
-import numpy as np
 import pytest
-import scipy.io.wavfile
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 
 class TestPipeline:
-    """End-to-end pipeline integration tests."""
+    """Streaming-final → Translation → TTS integration tests."""
 
     def test_text_only_pipeline_vi_en(self, pipeline):
         """Text-only shortcut: vi → en translation."""
@@ -57,34 +57,37 @@ class TestPipeline:
         assert len(result.translation) > 0
         print(f"\n  en→vi: {result.translation}")
 
-    def test_full_pipeline_with_synthetic_audio(self, pipeline, tmp_path):
-        """Full ASR → Translation → TTS with a synthetic tone.
+    def test_streaming_final_to_translation_tts(self, pipeline, tmp_path):
+        """Streaming FINAL (router active_lang) → Translation → TTS.
 
-        This test exercises all three stages but uses a synthetic tone
-        (not speech), so the ASR output will be noise/empty.  The goal
-        is to verify the pipeline doesn't crash end-to-end.
+        Simulates what StreamingOmniVoicePipeline does on endpoint: a
+        committed Zipformer transcript with its detected language.
         """
-        sr = 16000
-        duration_s = 2
-        tone = np.sin(2 * np.pi * 440 * np.arange(sr * duration_s) / sr).astype(np.float32)
-        wav_path = tmp_path / "input_tone.wav"
-        tone_int16 = (tone * 32767).astype(np.int16)
-        scipy.io.wavfile.write(str(wav_path), sr, tone_int16)
-
-        result = pipeline.process(
-            str(wav_path),
-            src_lang="en",
-            tgt_lang="vi",
+        result = pipeline.process_final_transcript(
+            "xin chào mọi người",
+            src_lang="vi",
+            tgt_lang="en",
             output_dir=str(tmp_path / "output"),
         )
 
-        assert isinstance(result.transcript, str)
-        assert isinstance(result.translation, str)
+        assert result.transcript == "xin chào mọi người"
+        assert result.src_language == "vi"
+        assert isinstance(result.translation, str) and len(result.translation) > 0
         assert result.audio_path is not None
         assert Path(result.audio_path).exists()
         assert result.timings["total_ms"] > 0
 
         print(f"\n  Timings: {result.timings}")
+
+    def test_streaming_empty_final_skips_stages(self, pipeline, tmp_path):
+        """Empty FINAL (silence endpoint) skips Translation and TTS."""
+        result = pipeline.process_final_transcript(
+            "   ", src_lang="vi", tgt_lang="en",
+            output_dir=str(tmp_path / "output"),
+        )
+        assert result.transcript == ""
+        assert result.translation == ""
+        assert result.audio_path is None
 
     def test_pipeline_result_timings(self, pipeline):
         """Verify timings dict has expected keys."""

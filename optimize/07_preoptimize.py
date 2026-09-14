@@ -11,7 +11,8 @@
 #     class reproduced on low-RAM targets)
 #
 # IMPORTANT: run with the SAME onnxruntime version the app ships (currently
-# 1.22.0) — optimized graphs are not portable across ORT versions:
+# 1.27.0, in lockstep with the sherpa-onnx AAR) — optimized graphs are not
+# portable across ORT versions:
 #   <venv>/Scripts/python optimize/07_preoptimize.py
 from __future__ import annotations
 
@@ -30,14 +31,9 @@ ASSETS = Path(__file__).resolve().parent.parent / "android/app/src/main/assets"
 BACKUP = Path(__file__).resolve().parent.parent / "onnx_models/preopt_backup"
 
 MODELS = [
-    "whisper_encoder.onnx",
-    "whisper_decoder.onnx",
-    "encoder_model_int8.onnx",
-    # NOT decoder_model_merged_int8.onnx: offline optimization (ALL and even
-    # BASIC) inlines/duplicates the merged If branches and balloons the file
-    # 467 MB -> 991 MB. The app loads that one unoptimized with ALL_OPT at
-    # runtime (ASR/Translation fall back automatically when *.opt.onnx is
-    # absent).
+    # Zipformer streaming models (sherpa-onnx) are already inference-ready;
+    # offline pre-opt is NOT applied to them — pass explicit --models if a
+    # future asset needs it.
 ]
 
 

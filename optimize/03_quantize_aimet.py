@@ -125,7 +125,7 @@ def quantize_aimet(model_path: Path, output_path: Path, calibration_data=None):
 
         # [Implementation depends on actual model architecture]
         log.warning("AIMET quantization requires model-specific calibration setup.")
-        log.warning("See AIMET documentation for NLLB/Whisper-specific guides.")
+        log.warning("See AIMET documentation for model-specific guides.")
 
     except ImportError:
         log.warning("AIMET not installed — this is expected on Windows.")

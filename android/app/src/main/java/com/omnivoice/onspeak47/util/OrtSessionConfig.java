@@ -24,8 +24,7 @@ import ai.onnxruntime.extensions.OrtxPackage;
  *       allocator and memory-pattern planner are disabled. Both pre-allocate
  *       from worst-case graph shapes and can inflate resident RAM
  *       substantially; disabling them trades a little speed for much lower
- *       memory (RTranslator's "low memory mode" runs Whisper in ~0.5 GB
- *       instead of ~0.9 GB). High-RAM devices keep both enabled.</li>
+ *       memory. High-RAM devices keep both enabled.</li>
  *   <li>NNAPI is off by default: with dynamic-int8 quantized models the NNAPI
  *       EP frequently falls back to CPU per-node and adds conversion
  *       overhead; RTranslator ships CPU-only. Flip {@link #USE_NNAPI} to
@@ -53,9 +52,9 @@ public final class OrtSessionConfig {
 
     /**
      * Enable the XNNPACK execution provider (experimental, Phase 3.1):
-     * accelerates fp32 Conv/MatMul workloads — most relevant for the Whisper
-     * encoder if it stays fp32. A/B on device with the PipelineOrchestrator
-     * timing/MEM[...] logs before making this true by default.
+     * accelerates fp32 Conv/MatMul workloads. A/B on device with the
+     * PipelineOrchestrator timing/MEM[...] logs before making this true
+     * by default.
      */
     public static final boolean USE_XNNPACK = false;
 

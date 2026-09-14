@@ -1,9 +1,10 @@
 /*
  * OmniVoice — Pipeline Orchestrator
  *
- * Strings the three models together: ASR → Translation → TTS.
- * NO language-branching or routing logic — every input goes through
- * the same three stages regardless of direction (per pipeline_overview.md).
+ * Strings the streaming transcript through Translation → TTS.
+ * ASR itself runs in asr/StreamingPipeline (Zipformer VI/EN/ZH, live
+ * partials + endpoint finals). Source language is the router's active
+ * language — there is no manual language-branching here.
  */
 
 package com.omnivoice.onspeak47.pipeline;
@@ -14,7 +15,7 @@ import java.io.File;
 
 
 /**
- * Chains ASR → Translation → TTS with no language branching.
+ * Chains streaming ASR finals → Translation → TTS with no language branching.
  * Modular design: each stage has clear I/O contracts so a future
  * wearable device can swap hardware backends without redesign.
  */
@@ -22,63 +23,62 @@ public class PipelineOrchestrator {
 
     private static final String TAG = "PipelineOrchestrator";
 
-    private final ASRModule asr;
     private final TranslationModule translator;
     private final TTSModule tts;
 
-    public PipelineOrchestrator(ASRModule asr, TranslationModule translator, TTSModule tts) {
-        this.asr = asr;
+    public PipelineOrchestrator(TranslationModule translator, TTSModule tts) {
         this.translator = translator;
         this.tts = tts;
     }
 
     /**
-     * Run the full pipeline: audio → text → translated text → audio.
+     * Run Translation → TTS on a streaming FINAL transcript.
      *
-     * @param audioPath Path to input audio (16kHz WAV)
-     * @param srcLang   Source language ("vi", "en", "zh")
-     * @param tgtLang   Target language
+     * @param transcript Streaming-committed FINAL text (already endpointed)
+     * @param srcLang    Router active language ("vi", "en", "zh")
+     * @param tgtLang    Target language
      * @return Pipeline result with transcript, translation, and output audio path,
      *         or null when {@code cancelled} became true between stages.
      */
-    public PipelineResult process(String audioPath, String srcLang, String tgtLang,
-                                  java.util.function.BooleanSupplier cancelled) {
+    public PipelineResult processStreamingFinal(String transcript, String srcLang, String tgtLang,
+                                                java.util.function.BooleanSupplier cancelled) {
+        return processStreamingFinal(transcript, srcLang, tgtLang, null, cancelled);
+    }
+
+    /**
+     * Overload with an explicit output directory for the synthesized WAV
+     * (the Activity passes getCacheDir(); null falls back to tmp).
+     */
+    public PipelineResult processStreamingFinal(String transcript, String srcLang, String tgtLang,
+                                                File outputDir,
+                                                java.util.function.BooleanSupplier cancelled) {
         long totalStart = System.currentTimeMillis();
         logMemory("start");
 
-        // --- Stage 1: ASR (Speech → Text) ---
-        long t0 = System.currentTimeMillis();
-        ASRModule.ASRResult asrResult = asr.transcribe(audioPath, srcLang);
-        long asrMs = System.currentTimeMillis() - t0;
-        Log.i(TAG, "ASR: \"" + asrResult.text + "\" (" + asrMs + "ms)");
-        logMemory("after-ASR");
+        String clean = transcript == null ? "" : transcript.trim();
+        if (clean.isEmpty()) {
+            Log.i(TAG, "Empty streaming transcript — skipping Translation and TTS");
+            long totalMs = System.currentTimeMillis() - totalStart;
+            return new PipelineResult("", "", null, 0, 0, 0, totalMs, null);
+        }
 
         if (cancelled.getAsBoolean()) return null;
 
-        // Empty transcript = silence/noise gated before or during ASR
-        // (energy gate or discarded hallucination). Translating and
-        // synthesizing an empty string costs seconds and produces junk,
-        // so stop here and let the UI show "no speech".
-        if (asrResult.text == null || asrResult.text.trim().isEmpty()) {
-            Log.i(TAG, "Empty transcript — skipping Translation and TTS");
-            long totalMs = System.currentTimeMillis() - totalStart;
-            return new PipelineResult("", "", null, asrMs, 0, 0, totalMs, null);
-        }
-
-        // --- Stage 2: Translation (Text → Translated Text) ---
-        t0 = System.currentTimeMillis();
+        // --- Stage 1: Translation (Text → Translated Text) ---
+        long t0 = System.currentTimeMillis();
         TranslationModule.TranslationResult translationResult =
-                translator.translate(asrResult.text, srcLang, tgtLang);
+                translator.translate(clean, srcLang, tgtLang);
         long translationMs = System.currentTimeMillis() - t0;
         Log.i(TAG, "Translation: \"" + translationResult.text + "\" (" + translationMs + "ms)");
         logMemory("after-Translation");
 
         if (cancelled.getAsBoolean()) return null;
 
-        // --- Stage 3: TTS (Translated Text → Speech) ---
+        // --- Stage 2: TTS (Translated Text → Speech) ---
         t0 = System.currentTimeMillis();
-        File outputDir = new File(audioPath).getParentFile();
-        String outputPath = new File(outputDir, "translated_" + srcLang + "_to_" + tgtLang + ".wav")
+        File dir = outputDir != null ? outputDir
+                : new File(System.getProperty("java.io.tmpdir", "."));
+        String outputPath = new File(dir, "translated_" + srcLang + "_to_" + tgtLang + ".wav")
                 .getAbsolutePath();
         String ttsPath = tts.synthesize(translationResult.text, tgtLang, outputPath);
         long ttsMs = System.currentTimeMillis() - t0;
@@ -91,17 +91,17 @@ public class PipelineOrchestrator {
         Log.i(TAG, "Pipeline total: " + totalMs + "ms");
 
         return new PipelineResult(
-                asrResult.text,
+                clean,
                 translationResult.text,
                 ttsPath,
-                asrMs, translationMs, ttsMs, totalMs,
+                0, translationMs, ttsMs, totalMs,
                 ttsError
         );
     }
 
     /** Convenience overload without cancellation. */
-    public PipelineResult process(String audioPath, String srcLang, String tgtLang) {
-        return process(audioPath, srcLang, tgtLang, () -> false);
+    public PipelineResult processStreamingFinal(String transcript, String srcLang, String tgtLang) {
+        return processStreamingFinal(transcript, srcLang, tgtLang, null, () -> false);
     }
 
     /**
@@ -120,7 +120,7 @@ public class PipelineOrchestrator {
     }
 
     /**
-     * Translation-only shortcut — skips ASR and TTS.
+     * Translation-only shortcut — skips TTS.
      */
     public PipelineResult translateText(String text, String srcLang, String tgtLang) {
         long t0 = System.currentTimeMillis();

@@ -1,15 +1,18 @@
-# Strings models together with NO language branching
+# Streaming-first pipeline: Zipformer streaming ASR → HyMT → MMS-TTS.
 #
-# Every input goes through the same three stages regardless of direction:
-#   [audio] → Whisper (ASR) → NLLB (Translation) → MMS-TTS (Synthesis) → [audio]
+# No Whisper path remains. Audio enters as 20 ms frames via
+# StreamingPipeline (backend/streaming_asr/pipeline.py); the source language
+# is the router's active language (auto VI/EN/ZH), never a manual hint.
+# Every input goes through ASR → Translation → TTS regardless of direction.
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
-from backend.asr_whisper import WhisperASR, ASRResult
+from backend.streaming_asr.pipeline import StreamingPipeline
 from backend.translation_hymt import HyMTTranslator
 from backend.tts_mms import MMSTTS
 
@@ -26,84 +29,86 @@ class PipelineResult:
 
 
 class OmniVoicePipeline:
-    """Three-stage on-device speech translation pipeline.
+    """Streaming-transcript → Translation → TTS pipeline.
 
     Architecture is intentionally modular — each stage has clear input/output
     contracts so a future wearable/lanyard device can swap in a different
     hardware backend without redesigning the pipeline.
 
-    The pipeline applies **no** language-routing logic: every input goes
-    through ASR → Translation → TTS regardless of direction.
+    The pipeline applies **no** manual language-routing logic: the source
+    language always comes from the streaming router's active language.
     """
 
     def __init__(
         self,
-        asr: WhisperASR | None = None,
         translator: HyMTTranslator | None = None,
         tts: MMSTTS | None = None,
+        # Deprecated: accepted for backwards compat with old tests/callers,
+        # ignored — ASR is always the streaming Zipformer stack now.
+        asr=None,
+        **kwargs,
     ):
-        self.asr = asr or WhisperASR()
         self.translator = translator or HyMTTranslator()
         self.tts = tts or MMSTTS()
 
     # ------------------------------------------------------------------
-    # Full pipeline: audio → audio
+    # Streaming final transcript → translation → TTS (production path)
     # ------------------------------------------------------------------
 
-    def process(
+    def process_final_transcript(
         self,
-        audio_path: str,
+        transcript: str,
         src_lang: str,
         tgt_lang: str,
         *,
         output_dir: str | Path = "output",
     ) -> PipelineResult:
-        """Run the complete ASR → Translation → TTS pipeline.
+        """Translate a streaming FINAL transcript and synthesize output audio.
 
         Parameters
         ----------
-        audio_path : str
-            Input audio file (any format librosa supports).
+        transcript : str
+            Committed FINAL text from StreamingPipeline (already endpointed).
         src_lang : str
-            Source language code (``"vi"``, ``"en"``, ``"zh"``).
+            Router active language (``"vi"``, ``"en"``, ``"zh"``).
         tgt_lang : str
             Target language code.
         output_dir : str | Path
             Directory for the synthesized output WAV.
-
-        Returns
-        -------
-        PipelineResult
         """
         timings: dict = {}
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- Stage 1: ASR ---
-        t0 = time.perf_counter()
-        asr_result: ASRResult = self.asr.transcribe(audio_path, language=src_lang)
-        timings["asr_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        transcript = (transcript or "").strip()
+        if not transcript:
+            return PipelineResult(
+                transcript="",
+                src_language=src_lang,
+                translation="",
+                tgt_language=tgt_lang,
+                audio_path=None,
+                timings={"total_ms": 0.0},
+            )
 
-        # --- Stage 2: Translation ---
+        # --- Stage 1: Translation ---
         t0 = time.perf_counter()
-        translated = self.translator.translate(
-            asr_result.text, src_lang, tgt_lang
-        )
+        translated = self.translator.translate(transcript, src_lang, tgt_lang)
         timings["translation_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
-        # --- Stage 3: TTS ---
+        # --- Stage 2: TTS ---
         t0 = time.perf_counter()
         out_wav = output_dir / f"translated_{src_lang}_to_{tgt_lang}.wav"
         self.tts.synthesize(translated, tgt_lang, out_wav)
         timings["tts_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
         timings["total_ms"] = round(
-            timings["asr_ms"] + timings["translation_ms"] + timings["tts_ms"], 1
+            timings["translation_ms"] + timings["tts_ms"], 1
         )
 
         return PipelineResult(
-            transcript=asr_result.text,
-            src_language=asr_result.language,
+            transcript=transcript,
+            src_language=src_lang,
             translation=translated,
             tgt_language=tgt_lang,
             audio_path=str(out_wav.resolve()),
@@ -111,7 +116,7 @@ class OmniVoicePipeline:
         )
 
     # ------------------------------------------------------------------
-    # Text-only pipeline (no ASR / no TTS) for quick evaluation
+    # Text-only pipeline (no ASR / no TTS input) for quick evaluation
     # ------------------------------------------------------------------
 
     def translate_text(
@@ -120,10 +125,7 @@ class OmniVoicePipeline:
         src_lang: str,
         tgt_lang: str,
     ) -> PipelineResult:
-        """Translation-only shortcut — skips ASR and TTS.
-
-        Useful for batch quality evaluation where audio is not involved.
-        """
+        """Translation-only shortcut — skips ASR and TTS synthesis."""
         t0 = time.perf_counter()
         translated = self.translator.translate(text, src_lang, tgt_lang)
         elapsed = round((time.perf_counter() - t0) * 1000, 1)
@@ -136,3 +138,62 @@ class OmniVoicePipeline:
             audio_path=None,
             timings={"translation_ms": elapsed, "total_ms": elapsed},
         )
+
+
+class StreamingOmniVoicePipeline:
+    """Live 20 ms frames → partials/finals → translate+TTS on endpoint.
+
+    Thin glue over StreamingPipeline for local tests and backend parity with
+    android/.../asr/StreamingPipeline.java. The caller feeds 20 ms frames;
+    every FINAL event is translated + synthesized via OmniVoicePipeline.
+    """
+
+    def __init__(
+        self,
+        translator: HyMTTranslator | None = None,
+        tts: MMSTTS | None = None,
+        tgt_lang: str = "en",
+        output_dir: str | Path = "output",
+        on_partial: Callable[[str, str, str], None] | None = None,
+        on_result: Callable[[PipelineResult], None] | None = None,
+        **streaming_kwargs,
+    ):
+        self.pipe = OmniVoicePipeline(translator=translator, tts=tts)
+        self.stream = StreamingPipeline(**streaming_kwargs)
+        self.tgt_lang = tgt_lang
+        self.output_dir = Path(output_dir)
+        self.on_partial = on_partial
+        self.on_result = on_result
+        self.results: list[PipelineResult] = []
+        self._seen_finals = 0
+
+    @property
+    def active_lang(self) -> str:
+        return self.stream.active_lang
+
+    @property
+    def partials(self):
+        return [e for e in self.stream.events if e[0] == "partial"]
+
+    def on_frame(self, frame, now_ms: int | None = None) -> PipelineResult | None:
+        """Feed one 20 ms frame; returns a PipelineResult when a FINAL fires."""
+        self.stream.on_frame(frame, now_ms)
+
+        if self.on_partial is not None:
+            partials = [e for e in self.stream.events if e[0] == "partial"]
+            if partials:
+                _, committed, speculative, lang = partials[-1]
+                self.on_partial(committed, speculative, lang)
+
+        finals = [e for e in self.stream.events if e[0] == "final"]
+        if len(finals) <= self._seen_finals:
+            return None
+        self._seen_finals = len(finals)
+        text, lang = finals[-1][1], finals[-1][2]
+        result = self.pipe.process_final_transcript(
+            text, lang, self.tgt_lang, output_dir=self.output_dir
+        )
+        self.results.append(result)
+        if self.on_result is not None:
+            self.on_result(result)
+        return result

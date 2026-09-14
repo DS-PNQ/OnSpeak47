@@ -1,8 +1,11 @@
 /*
  * OmniVoice — Main Translation Activity
  *
- * Provides the walkie-talkie style UI: user presses a button to speak,
- * the pipeline transcribes → translates → speaks the result.
+ * Streaming-first UI: toggle Start/Stop. While live, the Zipformer
+ * pipeline (AudioCapture → VAD → streaming ASR → router) renders partials
+ * continuously; each endpoint FINAL auto-translates → TTS. Source language
+ * is auto-detected by the router (VI/EN/ZH) — the UI only selects the
+ * translation target.
  */
 
 package com.omnivoice.onspeak47;
@@ -10,8 +13,8 @@ package com.omnivoice.onspeak47;
 import android.Manifest;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.util.Log;
-import android.view.MotionEvent;
 import android.view.View;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
@@ -25,7 +28,8 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import com.omnivoice.onspeak47.audio.AudioPlayer;
-import com.omnivoice.onspeak47.audio.AudioRecorder;
+import com.omnivoice.onspeak47.asr.StreamingController;
+import com.omnivoice.onspeak47.asr.StreamingPipeline;
 import com.omnivoice.onspeak47.pipeline.PipelineOrchestrator;
 import com.omnivoice.onspeak47.util.LanguageConfig;
 
@@ -36,46 +40,39 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 
 /**
- * Main translation screen with push-to-talk UI.
- *
- * Language directions supported:
- *   - Vietnamese ↔ English
- *   - Vietnamese ↔ Chinese (Simplified)
+ * Streaming translation screen with Start/Stop toggle.
  */
 public class TranslationActivity extends AppCompatActivity {
 
     private static final String TAG = "TranslationActivity";
     private static final int PERMISSION_REQUEST_AUDIO = 100;
 
-    // Silence gate: an RMS below ~-46 dBFS means the press caught no speech
-    // (pocket, table, button fumble). Whisper hallucinates fluent text on
-    // such input, so skip the whole pipeline instead of feeding it. Quiet
-    // but real speech sits well above this; the measured RMS is logged for
-    // per-device tuning.
-    private static final double SILENCE_RMS_THRESHOLD = 0.005;
-
     // UI elements
     private Button talkButton;
     private TextView transcriptView;
     private TextView translationView;
     private TextView timingView;
-    private Spinner srcLangSpinner;
     private Spinner tgtLangSpinner;
 
-    // Pipeline
+    // Pipeline (Translation → TTS; ASR lives in StreamingPipeline)
     private PipelineOrchestrator orchestrator;
-    private AudioRecorder recorder;
     private AudioPlayer player;
 
-    // State
-    private String srcLang = "vi";
-    private String tgtLang = "en";
-    private boolean isRecording = false;
+    // Streaming session
+    private final StreamingController streaming = new StreamingController();
+    private boolean isStreaming = false;
+    private String detectedLang = "vi";
+    // Accidental double-taps produced 10 ms sessions; ignore toggles faster
+    // than this.
+    private long lastToggleMs = 0;
+    private static final long TOGGLE_DEBOUNCE_MS = 400;
 
-    // Single-thread pipeline executor: ASR/NLLB/VITS are CPU-bound and each
-    // request holds decoder KV caches, so two concurrent pipelines spike RAM
-    // (critical on a ≤4 GB wearable) and thrash caches for no throughput gain.
-    // Rapid re-taps are latest-wins: a stale request exits at the next stage
+    // State
+    private String tgtLang = "en";
+
+    // Single-thread pipeline executor: Translation/TTS are CPU-bound, so two
+    // concurrent requests spike RAM and thrash caches for no throughput gain.
+    // Rapid finals are latest-wins: a stale request exits at the next stage
     // boundary via its generation counter.
     private ExecutorService pipelineExecutor;
     private final AtomicInteger requestGeneration = new AtomicInteger();
@@ -88,7 +85,6 @@ public class TranslationActivity extends AppCompatActivity {
         // Get pipeline from Application
         OmniVoiceApp app = (OmniVoiceApp) getApplication();
         orchestrator = app.getOrchestrator();
-        recorder = new AudioRecorder();
         player = new AudioPlayer();
         pipelineExecutor = Executors.newSingleThreadExecutor();
 
@@ -97,40 +93,32 @@ public class TranslationActivity extends AppCompatActivity {
         transcriptView = findViewById(R.id.txt_transcript);
         translationView = findViewById(R.id.txt_translation);
         timingView = findViewById(R.id.txt_timing);
-        srcLangSpinner = findViewById(R.id.spinner_src_lang);
         tgtLangSpinner = findViewById(R.id.spinner_tgt_lang);
 
-        setupLanguageSpinners();
-        setupTalkButton();
+        // Source spinner is gone in the streaming UI (router auto-detects);
+        // hide it if the layout still contains it.
+        View srcSpinner = findViewById(R.id.spinner_src_lang);
+        if (srcSpinner != null) srcSpinner.setVisibility(View.GONE);
+
+        setupTargetSpinner();
+        setupToggleButton();
+        updateToggleUi();
         requestAudioPermission();
     }
 
     // ----------------------------------------------------------------
-    // Language selection
+    // Target language selection (source is auto-detected)
     // ----------------------------------------------------------------
 
-    private void setupLanguageSpinners() {
+    private void setupTargetSpinner() {
         String[] languages = LanguageConfig.getDisplayNames();
 
         ArrayAdapter<String> adapter = new ArrayAdapter<>(
                 this, android.R.layout.simple_spinner_dropdown_item, languages
         );
 
-        srcLangSpinner.setAdapter(adapter);
         tgtLangSpinner.setAdapter(adapter);
-
-        // Defaults: vi → en
-        srcLangSpinner.setSelection(LanguageConfig.indexOf("vi"));
         tgtLangSpinner.setSelection(LanguageConfig.indexOf("en"));
-
-        srcLangSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
-                srcLang = LanguageConfig.getCodeAtIndex(pos);
-            }
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {}
-        });
 
         tgtLangSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
@@ -143,83 +131,120 @@ public class TranslationActivity extends AppCompatActivity {
     }
 
     // ----------------------------------------------------------------
-    // Push-to-talk button
+    // Start/Stop toggle
     // ----------------------------------------------------------------
 
-    private void setupTalkButton() {
-        talkButton.setOnTouchListener((v, event) -> {
-            switch (event.getAction()) {
-                case MotionEvent.ACTION_DOWN:
-                    startRecording();
-                    return true;
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL:
-                    stopRecordingAndTranslate();
-                    return true;
+    private void setupToggleButton() {
+        talkButton.setOnClickListener(v -> {
+            long now = SystemClock.uptimeMillis();
+            if (now - lastToggleMs < TOGGLE_DEBOUNCE_MS) return;
+            lastToggleMs = now;
+            if (isStreaming) {
+                stopStreaming();
+            } else {
+                startStreaming();
             }
-            return false;
         });
     }
 
-    private void startRecording() {
+    private void startStreaming() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
             requestAudioPermission();
             return;
         }
-        if (isRecording) return;
-        isRecording = true;
-        talkButton.setText(R.string.btn_recording);
-        transcriptView.setText("Listening...");
-        translationView.setText("");
-        timingView.setText("");
-
-        File audioFile = new File(getCacheDir(), "recording.wav");
-        recorder.startRecording(audioFile.getAbsolutePath());
-    }
-
-    private void stopRecordingAndTranslate() {
-        if (!isRecording) return;
-        isRecording = false;
-        talkButton.setText(R.string.btn_talk);
-        transcriptView.setText("Processing...");
-
+        if (isStreaming) return;
         if (orchestrator == null) {
             OmniVoiceApp app = (OmniVoiceApp) getApplication();
             orchestrator = app.getOrchestrator();
         }
-
-        String audioPath = recorder.stopRecording();
-        if (audioPath == null || orchestrator == null) {
-            transcriptView.setText("Error: no audio or pipeline not ready");
+        if (orchestrator == null) {
+            transcriptView.setText("Error: pipeline not ready");
             return;
         }
 
-        File audioFile = new File(audioPath);
-        Log.i(TAG, "Audio recorded: " + audioFile.length() + " bytes at " + audioPath);
+        transcriptView.setText("Đang nghe…");
+        translationView.setText("");
+        timingView.setText("");
+        detectedLang = "vi";
 
-        if (audioFile.length() <= 44) {
-            transcriptView.setText("Error: recording too short or silent");
-            return;
+        boolean ok;
+        try {
+            OmniVoiceApp app = (OmniVoiceApp) getApplication();
+            ok = streaming.start(this, app.getStreamingAsrModels(),
+                    new StreamingPipeline.Listener() {
+                @Override
+                public void onPartial(String stable, String speculative, String lang) {
+                    final String text = (stable + " " + speculative).trim();
+                    if (!text.isEmpty()) {
+                        detectedLang = lang;
+                        runOnUiThread(() ->
+                                transcriptView.setText("[" + lang + "] " + text + "…"));
+                    }
+                }
+
+                @Override
+                public void onFinal(String text, String lang) {
+                    if (text == null || text.trim().isEmpty()) return;
+                    detectedLang = lang;
+                    final String finalText = text;
+                    final String finalLang = lang;
+                    runOnUiThread(() -> transcriptView.setText(finalText));
+                    translateFinal(finalText, finalLang);
+                }
+
+                @Override
+                public void onLanguageSwitch(String fromLang, String toLang) {
+                    detectedLang = toLang;
+                    Log.i(TAG, "streaming language switch: " + fromLang + " → " + toLang);
+                }
+
+                @Override
+                public void onMetrics(String summaryJson) {
+                    Log.i(TAG, "streaming metrics: " + summaryJson);
+                }
+            });
+        } catch (Exception e) {
+            Log.w(TAG, "streaming start failed", e);
+            ok = false;
         }
 
-        // Energy gate — see SILENCE_RMS_THRESHOLD.
-        double rms = computePcmRms(audioPath);
-        Log.i(TAG, "Recorded audio RMS: "
-                + String.format(java.util.Locale.US, "%.4f", rms));
-        if (rms >= 0 && rms < SILENCE_RMS_THRESHOLD) {
-            transcriptView.setText(R.string.no_speech);
-            translationView.setText("");
-            timingView.setText("");
+        if (!ok) {
+            transcriptView.setText("Error: streaming ASR unavailable (missing models?)");
             return;
         }
+        isStreaming = true;
+        updateToggleUi();
+        Log.i(TAG, "streaming started");
+    }
 
-        // Run pipeline on the single-thread executor (latest-wins cancel)
+    private void stopStreaming() {
+        if (!isStreaming) return;
+        isStreaming = false;
+        try {
+            streaming.stop();
+        } catch (Exception e) {
+            Log.w(TAG, "streaming stop failed", e);
+        }
+        updateToggleUi();
+        Log.i(TAG, "streaming stopped");
+    }
+
+    private void updateToggleUi() {
+        talkButton.setText(isStreaming
+                ? getString(R.string.btn_stop)
+                : getString(R.string.btn_start));
+    }
+
+    /** Translate one endpoint FINAL in the background (latest-wins). */
+    private void translateFinal(String text, String srcLang) {
+        if (orchestrator == null) return;
         final int generation = requestGeneration.incrementAndGet();
+        final File cacheDir = getCacheDir();
         pipelineExecutor.execute(() -> {
             try {
                 PipelineOrchestrator.PipelineResult result =
-                        orchestrator.process(audioPath, srcLang, tgtLang,
+                        orchestrator.processStreamingFinal(text, srcLang, tgtLang, cacheDir,
                                 () -> generation != requestGeneration.get());
 
                 if (result == null                 // superseded between stages
@@ -229,15 +254,11 @@ public class TranslationActivity extends AppCompatActivity {
                 }
 
                 runOnUiThread(() -> {
-                    transcriptView.setText(result.transcript.isEmpty()
-                            ? getText(R.string.no_speech)
-                            : result.transcript);
                     translationView.setText(result.translation);
                     timingView.setText(String.format(
-                            "ASR: %dms | Translation: %dms | TTS: %dms | Total: %dms",
-                            result.asrMs, result.translationMs, result.ttsMs, result.totalMs
+                            "Translation: %dms | TTS: %dms | Total: %dms",
+                            result.translationMs, result.ttsMs, result.totalMs
                     ));
-                    // Surface the real TTS failure on screen instead of a silent 0ms.
                     if (result.ttsError != null) {
                         android.widget.Toast.makeText(
                                 TranslationActivity.this,
@@ -246,48 +267,15 @@ public class TranslationActivity extends AppCompatActivity {
                     }
                 });
 
-                // Play the translated audio
                 if (result.audioPath != null) {
                     player.play(result.audioPath);
                 }
 
             } catch (Exception e) {
                 Log.e(TAG, "Pipeline error", e);
-                runOnUiThread(() -> transcriptView.setText("Error: " + e.getMessage()));
+                runOnUiThread(() -> translationView.setText("Error: " + e.getMessage()));
             }
         });
-    }
-
-    // ----------------------------------------------------------------
-    // Silence gate
-    // ----------------------------------------------------------------
-
-    /**
-     * RMS of the recorded 16-bit little-endian mono PCM, normalized to
-     * 0..1 — or -1 when the file cannot be read, so the gate is skipped
-     * rather than misfiring on real audio. The header is the 44 bytes
-     * AudioRecorder writes before the data chunk.
-     */
-    private static double computePcmRms(String wavPath) {
-        try (java.io.FileInputStream fis = new java.io.FileInputStream(wavPath)) {
-            byte[] header = new byte[44];
-            if (fis.read(header) < 44) return -1;
-            byte[] buf = new byte[4096];
-            long sumSq = 0;
-            long count = 0;
-            int read;
-            while ((read = fis.read(buf)) > 0) {
-                for (int i = 1; i < read; i += 2) {
-                    short s = (short) (((buf[i] & 0xFF) << 8) | (buf[i - 1] & 0xFF));
-                    sumSq += (long) s * s;
-                    count++;
-                }
-            }
-            return count == 0 ? 0.0 : Math.sqrt((double) sumSq / count) / 32768.0;
-        } catch (java.io.IOException e) {
-            Log.w(TAG, "RMS read failed: " + e.getMessage());
-            return -1;
-        }
     }
 
     // ----------------------------------------------------------------
@@ -313,7 +301,7 @@ public class TranslationActivity extends AppCompatActivity {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 Log.i(TAG, "Audio permission granted");
             } else {
-                Log.w(TAG, "Audio permission denied — recording won't work");
+                Log.w(TAG, "Audio permission denied — streaming won't work");
             }
         }
     }
@@ -321,6 +309,11 @@ public class TranslationActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        try {
+            streaming.shutdown();
+        } catch (Exception e) {
+            Log.w(TAG, "streaming shutdown failed", e);
+        }
         if (player != null) player.release();
         if (pipelineExecutor != null) {
             pipelineExecutor.shutdownNow();

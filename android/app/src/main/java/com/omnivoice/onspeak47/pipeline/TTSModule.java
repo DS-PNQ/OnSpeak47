@@ -791,7 +791,7 @@ public class TTSModule {
                 opts.registerCustomOpLibrary(OrtxPackage.getLibraryPath());
             } catch (OrtException e) { /* extensions optional */ }
             // NOTE: NNAPI is intentionally NOT enabled for MMS-TTS (VITS).
-            // Unlike Whisper/NLLB, the VITS decoder graph is built from ops
+            // The VITS decoder graph is built from ops
             // NNAPI does not support: 1D Conv (NNAPI is 2D-only),
             // RandomNormalLike (the noise sampling node), 1D Resize/Upsample
             // and dynamic-shape Scatter/CumSum duration expansion. Registering

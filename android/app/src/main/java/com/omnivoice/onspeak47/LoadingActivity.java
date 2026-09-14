@@ -14,8 +14,8 @@ import androidx.appcompat.app.AppCompatActivity;
 
 
 /**
- * Loading screen shown at launch while the three ONNX models
- * (Whisper, NLLB, MMS-TTS) are initialized.
+ * Loading screen shown at launch while the on-device models
+ * (streaming Zipformer ASR, HyMT translation, MMS-TTS) are initialized.
  */
 public class LoadingActivity extends AppCompatActivity {
 
@@ -38,12 +38,12 @@ public class LoadingActivity extends AppCompatActivity {
     private void startModelLoading() {
         OmniVoiceApp app = (OmniVoiceApp) getApplication();
 
-        updateStatus("Loading ASR model (Whisper Small)...", 0);
+        updateStatus("Loading streaming ASR (Zipformer VI/EN/ZH)...", 0);
 
-        app.initializeASR(new OmniVoiceApp.InitListener() {
+        app.initializeStreamingAsr(new OmniVoiceApp.InitListener() {
             @Override
             public void onInitialized() {
-                updateStatus("Loading Translation model (NLLB-200)...", 33);
+                updateStatus("Loading Translation model (HyMT-1.5)...", 33);
 
                 app.initializeTranslation(new OmniVoiceApp.InitListener() {
                     @Override

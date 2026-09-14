@@ -4,9 +4,9 @@
 
 Edge AI Challenge, Phase 2 | Public Services domain | Android-first, wearable-ready
 
-> Snapshot: this README describes the project state **before VAD auto-listen
-> was added** — input is push-to-talk only, with a post-record RMS silence
-> gate. Translation runs on the Hy-MT1.5 GGUF path below.
+> Snapshot: this README describes the **streaming-first** project state —
+> input is Start/Stop streaming toggle with live Zipformer partials and
+> VAD endpointing. There is no Whisper path and no WAV staging.
 
 ---
 
@@ -14,20 +14,20 @@ Edge AI Challenge, Phase 2 | Public Services domain | Android-first, wearable-re
 
 ```
 [User speaks]
-    → Whisper Small — transcribes speech to text
+    → Streaming Zipformer (VI/EN/ZH auto-router) — live partials + endpoint finals
     → Hy-MT1.5-1.8B-1.25bit GGUF — translates text between VN/EN/CN
     → MMS-TTS — converts translated text back to speech
 [Translated speech plays]
 ```
 
-Three models, three stages. No language-branching — every input goes through the same path.
+Three models, three stages. Source language is auto-detected by the
+streaming router — the UI only selects the translation target.
 
-**ASR runs streaming-class fast**: the Whisper decoder is a custom KV-cache
-export (constant per-token cost instead of O(n²)) and the encoder accepts the
-audio's real length (a 3 s clip no longer pays a full 30 s encoder window).
-End-to-end ASR on ~3 s clips measured **~10× faster** (en 5515→533 ms,
-vi 5160→570 ms, desktop ort 1.22) with quality equal or better — see
-`docs/optimization_results.md`.
+**ASR is true streaming**: `AudioRecord` 16 kHz → 20 ms frames → ring
+buffer → Silero VAD → 160 ms scheduler → active Zipformer → partial
+transcript → async LID (400–600 ms) → router → 640 ms rollback +
+candidate verification on code-switch. P50 target 250–350 ms, P95 <500 ms
+on the Snapdragon target — see `docs/streaming_asr.md`.
 
 **Translation runs on a single GGUF backend**: Tencent Hy-MT1.5-1.8B quantized
 to 1.25-bit STQ (Sherry, 440 MB), decoded on the mobile CPU by llama.cpp +
@@ -42,35 +42,29 @@ the real end-of-assistant token (`120020`), and short ASR transcripts take a
 ```
 OnSpeak47/
 ├── backend/                    # Python pipeline modules
-│   ├── asr_whisper.py         # Whisper Small ASR wrapper
+│   ├── streaming_asr/         # Zipformer streaming reference (ring/VAD/LID/router/rollback/partial/metrics/pipeline)
 │   ├── translation_hymt.py    # Hy-MT1.5 translation (greedy, single-call)
 │   ├── tts_mms.py             # MMS-TTS speech synthesis
-│   └── orchestrator.py        # ASR → Translation → TTS pipeline
+│   └── orchestrator.py        # Streaming FINAL → Translation → TTS pipeline
 │
 ├── tests_local/               # Local quality tests (no device needed)
 │   ├── conftest.py            # Fixtures for all test modules
-│   ├── test_01_asr.py         # Whisper transcription accuracy
 │   ├── test_02_translation.py # Hy-MT translation scoring
 │   ├── test_04_vizh_corpus.py # Large-corpus VI↔ZH evaluation
-│   ├── test_05_pipeline.py    # End-to-end pipeline tests
-│   ├── test_06_onnx_parity.py # ONNX parity GATE (Whisper assets)
-│   ├── gen_parity_reference.py     # Generates the PyTorch greedy reference
-│   ├── verify_preprocess_onnx.py   # whisper_preprocess.onnx sanity check
-│   ├── diagnose_whisper_paths.py   # Decodes two fixtures on every asset variant
+│   ├── test_05_pipeline.py    # Streaming-final → Translation → TTS tests
+│   ├── test_07_streaming_asr.py # Streaming ASR state-machine gate (22 tests)
 │   ├── baselines/             # Recorded regression baseline (auto-created)
 │   ├── output/                # Latest gate/parity results (JSON)
 │   └── data/
 │       ├── parallel_sentences.json     # 40 hand-curated test sentences
-│       └── audio_samples/              # ASR parity fixtures (WAV + reference text)
+│       └── audio_samples/              # Test fixtures
 │
 ├── optimize/                  # Model asset preparation
+│   ├── 11_fetch_streaming_zipformer.py # Fetch Zipformer VI/EN/ZH + Silero VAD
 │   ├── 07_prepare_hymt_gguf.py       # Fetch Hy-MT 1.25-bit GGUF + typefix
 │   ├── 08_export_hymt_onnx_int4.py   # Reference: INT4 ONNX export (ORT GenAI)
 │   ├── hymt_gguf_typefix.py          # Remap legacy STQ tensor-type codes
-│   ├── 01_export_onnx.py     # Whisper ONNX export
 │   ├── 07_preoptimize.py     # Offline ORT graph pre-opt (*.opt.onnx)
-│   ├── 09_export_whisper_decoder_kv.py # KV-cached Whisper decoder (CURRENT)
-│   ├── 10_export_whisper_encoder_dyn.py # Dynamic-length Whisper encoder (CURRENT)
 │   └── export_mms_tts.py     # MMS-TTS export
 │
 ├── android/                   # Android app (OmniVoice)
@@ -78,10 +72,12 @@ OnSpeak47/
 │   │   ├── java/com/omnivoice/onspeak47/
 │   │   │   ├── OmniVoiceApp.java
 │   │   │   ├── LoadingActivity.java
-│   │   │   ├── TranslationActivity.java   # Push-to-talk UI + RMS silence gate
-│   │   │   ├── pipeline/     # ASR, Translation (GGUF), HyMtGgufJNI bridge,
+│   │   │   ├── TranslationActivity.java   # Start/Stop streaming toggle + auto translate
+│   │   │   ├── pipeline/     # Translation (GGUF), HyMtGgufJNI bridge,
 │   │   │   │                 # TTS, PipelineOrchestrator, Tokenizer
-│   │   │   ├── audio/        # AudioRecorder (manual record), AudioPlayer
+│   │   │   ├── asr/          # Streaming Zipformer (AudioCapture, Pipeline,
+│   │   │   │                 # VAD, LID, Router, Rollback, ModelManager)
+│   │   │   ├── audio/        # AudioPlayer (no recorder — mic via AudioCapture)
 │   │   │   └── util/         # LanguageConfig, OrtSessionConfig, TensorUtils
 │   │   ├── cpp/              # hymt_gguf_jni.cpp + CMakeLists (vendored llama.cpp)
 │   │   └── res/              # Layouts, values, raw language XMLs
@@ -133,14 +129,10 @@ python -m pytest tests_local/test_05_pipeline.py -v -s
 python -m pytest tests_local/ -v -s
 ```
 
-### ONNX parity GATE (Whisper assets)
-Runs the exact on-device inference scheme against the bundled assets.
-Use a python with **onnxruntime==1.22.0** (the version the app ships):
-
+### Streaming ASR gate (no models/network needed)
 ```powershell
-python -m venv .venv-ort122
-.venv-ort122\Scripts\pip install "onnxruntime==1.22.0" numpy pytest jiwer sacrebleu sentencepiece
-.venv-ort122\Scripts\python -m pytest tests_local\test_06_onnx_parity.py -v
+python -m pytest tests_local/test_07_streaming_asr.py -v
+python -m backend.streaming_asr.bench
 ```
 
 ## Translation Backend (Hy-MT1.5-1.8B-1.25bit)
@@ -198,14 +190,19 @@ The Android app is in `android/`. To build:
    Build → Make Project (or Run ▶ on a device)
 
 > The APK is built for **arm64-v8a only** (`abiFilters 'arm64-v8a'`).
-> Input is **push-to-talk**: hold the button to record; recordings below the
-> RMS silence threshold are rejected before ASR (no VAD auto-listen yet).
+> Input is **streaming toggle**: tap Start to open the mic (live partials),
+> tap Stop to close it. Each VAD endpoint FINAL auto-translates → TTS.
+> Fetch streaming assets first:
+> `python optimize/11_fetch_streaming_zipformer.py --all --stage-assets`.
 
 Required assets:
+- `sherpa-onnx-1.13.4.aar` in `android/app/libs/` (gitignored — fetch from
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar)
 - `Hy-MT1.5-1.8B-1.25bit.gguf` (translation, post-typefix revision)
-- `whisper_encoder.opt.onnx` (dynamic-length int8)
-- `whisper_decoder.opt.onnx` (KV-cached int8)
-- `whisper_preprocess.onnx` / `whisper_postprocess.onnx` / `whisper_vocab.json`
+- `zipformer_vi_encoder.onnx` / `zipformer_vi_decoder.onnx` / `zipformer_vi_joiner.onnx` / `zipformer_vi_tokens.txt`
+- `zipformer_en_encoder.onnx` / `zipformer_en_decoder.onnx` / `zipformer_en_joiner.onnx` / `zipformer_en_tokens.txt`
+- `zipformer_zh_encoder.int8.onnx` / `zipformer_zh_decoder.onnx` / `zipformer_zh_joiner.int8.onnx` / `zipformer_zh_tokens.txt`
+- `silero_vad.onnx` (VAD; missing → energy-gate fallback)
 - `mms_tts_vi.onnx` + `mms_tts_vi_vocab.json` (MMS-TTS Vietnamese)
 - `mms_tts_en.onnx` + `mms_tts_en_config.json` + `mms_tts_en_vocab.json` (MMS-TTS English)
 
@@ -227,7 +224,7 @@ Required assets:
 ## Benchmarking On-Device
 
 ```powershell
-adb logcat -s HyMtGgufJNI TranslationModule PipelineOrchestrator ASRModule
+adb logcat -s HyMtGgufJNI TranslationModule PipelineOrchestrator StreamingPipeline LanguageRouter AsrMetrics
 ```
 
 - `decode: prompt=N tok (prefill …ms) + M tok (gen …ms, …tok/s)` — translation
@@ -238,14 +235,41 @@ adb logcat -s HyMtGgufJNI TranslationModule PipelineOrchestrator ASRModule
 - **Modular pipeline stages** — clear I/O contracts between ASR, Translation, TTS
 - **Decoder-only translation** — instruction-prompted Hy-MT1.5 (no seq2seq
   encoder graphs, no SentencePiece BPE, no beam search)
-- **Streaming-class ASR decode** — KV-cached zero-copy greedy decode with
-  whole-sequence fallback; row-only logits argmax
-- **Short-window encoder** — dynamic-length encoder input; short clips feed only
-  their real mel frames (~10× less encoder compute for a 3 s clip)
-- **ONNX Runtime** for Whisper inference (offline pre-optimized `*.opt.onnx`
-  loaded with NO_OPT); **llama.cpp** for translation
-- **Push-to-talk input** — single-thread pipeline executor with latest-wins
-  cancel; silence rejected by an RMS energy gate after recording
+- **True streaming ASR** — Zipformer transducer with incremental state,
+  160 ms scheduler, async LID + router + 640 ms rollback (no WAV staging)
+- **sherpa-onnx** for streaming ASR; **ONNX Runtime** for VAD/TTS;
+  **llama.cpp** for translation
+- **Streaming toggle input** — mic stays open while live; VAD endpoints
+  finalize utterances; single-thread executor with latest-wins cancel
 - **Two-backend TTS** — neural MMS-TTS (ONNX) for VN/EN when bundled, with the
   Android system TextToSpeech engine as an automatic fallback (and the only
   backend for Chinese)
+
+## Known Issues & Limitations (streaming ASR)
+
+Device-validated unless noted; logic gates (`test_07`, bench A–D) green.
+
+1. **Vietnamese-first assumption, no acoustic LID yet.** Every session
+   starts on the VI decoder; intra-utterance switching needs LID > 0.72 +
+   margin + shadow verification, which the flat text/acoustic priors cannot
+   reach without a real acoustic model — so English spoken mid-session is
+   first transcribed as VI garbage (`HELLO` → `HEO`) and only
+   whole-utterance switches are recovered at endpoints (text-aware
+   verification). Intra-utterance code-switch and reliable ZH detection
+   need a bundled acoustic LID model (roadmap in `docs/streaming_asr.md`).
+2. **Endpoint trade-off (2000 ms silence).** Natural pauses no longer split
+   sentences, but hands-free finals arrive ~2 s after speech stops (plus
+   translation). Tapping Stop flushes immediately.
+3. **sherpa/ORT version lockstep.** The app pins sherpa-onnx v1.13.4
+   (vendored `android/app/libs/*.aar`, gitignored) with
+   onnxruntime-android 1.27.0. Both ship `libonnxruntime.so` with ELF
+   versioned symbols — bumping either side alone crashes at startup
+   (`cannot locate symbol OrtGetApiBase`). Related rule: never decode
+   without `isReadyToDecode()` — sherpa aborts the whole process on an
+   under-buffered decode (no exception is thrown).
+4. **Memory.** Full stack (VI+EN+ZH + HyMT + TTS) measures ~1.3 GB PSS on
+   an 8 GB device; the 6 GB / 4 GB lazy buckets are designed but less
+   validated on-device.
+5. **Upstream caveat.** ORT 1.27.0 is reported to miscompute the zipformer2
+   int8 encoder on Snapdragon 8 Elite Gen 5 (k2-fsa/sherpa-onnx#3845);
+   fixed upstream in 1.28.0, which no sherpa Android release bundles yet.

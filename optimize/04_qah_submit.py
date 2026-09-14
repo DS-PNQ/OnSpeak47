@@ -1,10 +1,10 @@
 # Scripts to trigger compile/profile jobs on Qualcomm AI Hub (QAH)
 #
-# Per pipeline_overview.md:
-#   - BYOM (Bring Your Own Model) for NLLB and MMS-TTS
-#   - Whisper Small is natively in QAH catalog
+# Streaming-first pipeline:
+#   - BYOM (Bring Your Own Model) for Zipformer streaming ASR and MMS-TTS
 #   - After profile job: ALWAYS check execution provider (NPU vs CPU)
 #   - Never report latency as "NPU-accelerated" without confirming
+#   - CPU INT8 is the baseline; QNN/NNAPI only after benchmark wins
 
 from __future__ import annotations
 
@@ -155,8 +155,9 @@ def submit_all_models(onnx_dir: Path, device_name: str):
     """Submit compile + profile jobs for all pipeline models.
 
     Expected structure in onnx_dir:
-      - nllb/*.onnx
-      - whisper/*.onnx
+      - zipformer_vi/*.onnx (streaming Zipformer VI)
+      - zipformer_en/*.onnx (streaming Zipformer EN)
+      - zipformer_zh/*.onnx (streaming Zipformer ZH INT8)
       - mms_tts/*/*.onnx
     """
     if not check_qah_installed():
@@ -164,10 +165,9 @@ def submit_all_models(onnx_dir: Path, device_name: str):
 
     models_to_submit = [
         # (name, path pattern)
-        ("NLLB Encoder", "nllb/*encoder*.onnx"),
-        ("NLLB Decoder", "nllb/*decoder*.onnx"),
-        ("Whisper Encoder", "whisper/*encoder*.onnx"),
-        ("Whisper Decoder", "whisper/*decoder*.onnx"),
+        ("Zipformer VI Encoder", "zipformer_vi/*encoder*.onnx"),
+        ("Zipformer EN Encoder", "zipformer_en/*encoder*.onnx"),
+        ("Zipformer ZH Encoder", "zipformer_zh/*encoder*.onnx"),
         ("MMS-TTS Vietnamese", "mms_tts/vie/*.onnx"),
         ("MMS-TTS English", "mms_tts/eng/*.onnx"),
     ]
