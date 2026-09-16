@@ -86,7 +86,12 @@ def download_via_hf_hub(dst: Path) -> bool:
 
 
 def download_resumable(url: str, dst: Path, max_retries: int = 10) -> bool:
-    import requests
+    try:
+        import requests
+    except ImportError:
+        log.warning("  [Deps] 'requests' not installed — stdlib urllib fallback "
+                    "(pip install requests huggingface_hub for the robust path)")
+        return _download_resumable_urllib(url, dst, max_retries)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".tmp")
@@ -95,7 +100,7 @@ def download_resumable(url: str, dst: Path, max_retries: int = 10) -> bool:
         try:
             downloaded = tmp.stat().st_size if tmp.exists() else 0
             if downloaded >= EXPECTED_SIZE:
-                tmp.rename(dst)
+                tmp.replace(dst)  # os.replace: atomic overwrite, Windows-safe
                 return verify(dst)
 
             headers = {}
@@ -127,13 +132,67 @@ def download_resumable(url: str, dst: Path, max_retries: int = 10) -> bool:
 
             sys.stdout.write("\n")
             if tmp.stat().st_size == EXPECTED_SIZE:
-                if dst.exists():
-                    dst.unlink()
-                tmp.rename(dst)
+                tmp.replace(dst)  # os.replace: atomic overwrite, Windows-safe
                 return verify(dst)
 
         except (requests.RequestException, IOError) as e:
             sys.stdout.write("\n")
+            log.warning(f"  [Warning] Connection interrupted: {e}. Retrying in 3s...")
+            time.sleep(3)
+
+    return False
+
+
+def _download_resumable_urllib(url: str, dst: Path, max_retries: int = 10) -> bool:
+    """Stdlib fallback when `requests` is unavailable: single-stream HTTP(S)
+    with Range resume and the same .tmp + size-verify contract."""
+    import urllib.error
+    import urllib.request
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            downloaded = tmp.stat().st_size if tmp.exists() else 0
+            if downloaded >= EXPECTED_SIZE:
+                tmp.replace(dst)
+                return verify(dst)
+
+            req = urllib.request.Request(url)
+            if downloaded > 0:
+                req.add_header("Range", f"bytes={downloaded}-")
+                log.info(f"  [Resume] Attempt {attempt}/{max_retries}: resuming from {downloaded / 1e6:.1f} MB...")
+            else:
+                log.info(f"  [Download] Attempt {attempt}/{max_retries}: {url}")
+
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = resp.status
+                if status not in (200, 206):
+                    log.error(f"  [Error] HTTP {status}")
+                    time.sleep(2)
+                    continue
+
+                mode = "ab" if downloaded > 0 and status == 206 else "wb"
+                if mode == "wb":
+                    downloaded = 0
+                with open(tmp, mode) as f:
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+            sys.stdout.write(f"\r    Progress: {int(downloaded * 100 / EXPECTED_SIZE)}% "
+                             f"({downloaded / 1e6:.1f}/{EXPECTED_SIZE / 1e6:.1f} MB)\n")
+            sys.stdout.flush()
+            if tmp.stat().st_size == EXPECTED_SIZE:
+                tmp.replace(dst)
+                return verify(dst)
+            log.warning(f"  [Warning] Incomplete ({tmp.stat().st_size}/{EXPECTED_SIZE} bytes). Retrying in 3s...")
+            time.sleep(3)
+        except Exception as e:
             log.warning(f"  [Warning] Connection interrupted: {e}. Retrying in 3s...")
             time.sleep(3)
 
