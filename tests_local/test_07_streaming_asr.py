@@ -665,6 +665,141 @@ def test_endpoint_lexical_switch_single_english_word():
     assert finals[-1][2] == "en"
 
 
+def test_candidate_weak_winner_never_commits():
+    """Field-log regression: VI won a fallback commit at 0.32 and the whole
+    English utterance finalized Vietnamese. Candidates now need 0.65 + 0.10
+    margin, so weak garbage finalizes empty on UND instead of forcing VI."""
+    now, clock = make_clock()
+    engines = {}
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        if lang == "vi":
+            # VI-decoded English: low-confidence garbage, no lexical fit.
+            e.decode_hook = lambda fed: ("o a e o", 0.3) if fed >= 1600 else ("", 0.5)
+        return e
+
+    p = StreamingPipeline(clock=clock, factory=factory)  # heuristic: uncertain
+    t = 0
+    for _ in range(150):  # 3 s — past MAX window, several candidate passes
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    assert p.active_lang == "und", "weak candidates must not commit a language"
+    for _ in range(120):
+        t += 20
+        now[0] = t
+        p.on_frame([0.0] * 320, t)
+    finals = [e for e in p.events if e[0] == "final"]
+    assert finals and finals[-1][1] == "" and finals[-1][2] == "und"
+
+
+def _en_leaning_uncertain(audio):
+    # Fused EN ~= 0.66: above the provisional bar (0.60) but below the
+    # bootstrap gate (0.70) — uncertain with an EN lean.
+    return {"en": 0.70, "vi": 0.20, "zh": 0.10}
+
+
+def test_provisional_quiet_when_evidence_leaves_vi_engine_not_resident():
+    """4 GB bucket (VI-only resident): persistent EN-leaning evidence quiets
+    the VI provisional stream instead of rendering VI guesses for EN audio."""
+    now, clock = make_clock()
+    engines = {}
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        if lang == "vi":
+            # Ever-changing garbage: without the quiet gate every 160 ms
+            # chunk would post a new partial.
+            e.decode_hook = lambda fed: (("o a %d" % (fed // 2560)), 0.4) \
+                if fed >= 1600 else ("", 0.5)
+        return e
+
+    p = StreamingPipeline(clock=clock, factory=factory,
+                          acoustic_scorer=_en_leaning_uncertain,
+                          total_mem_gb=4.0)
+    t = 0
+    for _ in range(30):  # 600 ms: two uncertain hops, both EN-leaning
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    assert p.active_lang == "und"
+    assert p._provisional_quiet is True
+    n_partials = len([e for e in p.events if e[0] == "partial"])
+    for _ in range(30):  # another 600 ms while quiet
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    assert len([e for e in p.events if e[0] == "partial"]) == n_partials
+
+
+def test_provisional_follows_evidence_when_engine_resident():
+    """8 GB bucket: persistent EN-leaning evidence moves the provisional
+    decoder to EN (no lazy-load on the live path — only resident engines)."""
+    now, clock = make_clock()
+    engines = {}
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        return e
+
+    p = StreamingPipeline(clock=clock, factory=factory,
+                          acoustic_scorer=_en_leaning_uncertain,
+                          total_mem_gb=8.0)
+    t = 0
+    for _ in range(30):  # 600 ms: two uncertain hops, both EN-leaning
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    assert p.active_lang == "und"
+    assert p._provisional_lang == "en"
+    assert p._provisional_quiet is False
+    assert p._provisional_complete is False  # head audio not in this stream
+
+
+def test_referee_firms_up_weak_candidate_commit():
+    """A weak fallback commit (0.65–0.69) is re-evaluated: strong acoustic
+    agreement firms the decision and stops the referee (no endless ECAPA)."""
+    now, clock = make_clock()
+    engines = {}
+
+    def factory(lang):
+        e = FakeEngine(lang)
+        engines[lang] = e
+        if lang == "en":
+            e.decode_hook = lambda fed: ("hello world team", 0.75) if fed >= 1600 else ("", 0.5)
+        return e
+
+    acoustic = [lambda audio: {"vi": 1.0 / 3, "en": 1.0 / 3, "zh": 1.0 / 3}]
+    p = StreamingPipeline(clock=clock, factory=factory,
+                          acoustic_scorer=lambda audio: acoustic[0](audio))
+    t = 0
+    for _ in range(80):  # 1.6 s heuristic-flat: 6 referee attempts, then pair
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    assert p.active_lang == "en", "candidate fallback should commit EN"
+    assert p._bootstrap_commit_conf < 0.70, "fallback commit must be weak"
+    # Strong acoustic agreement arrives after the commit.
+    acoustic[0] = lambda audio: {"en": 0.9, "vi": 0.05, "zh": 0.05}
+    attempts_before = p._referee_attempts
+    for _ in range(60):  # 1.2 s more speech: referee fires on 800 ms cadence
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    assert p._bootstrap_commit_conf >= 0.70, "referee agreement must firm up"
+    assert p._referee_attempts > attempts_before
+    attempts_firmed = p._referee_attempts
+    for _ in range(60):
+        t += 20
+        now[0] = t
+        p.on_frame(_speech_frame(), t)
+    assert p._referee_attempts == attempts_firmed, "firmed decision stops referee"
+
+
 def test_endpoint_loanword_stays_vietnamese():
     """A fluent VI sentence with an English loanword must NOT flip to EN."""
     now, clock = make_clock()
@@ -766,7 +901,8 @@ def test_voxlingua_scores_bootstrap_gate():
 
     confident_en = LanguageScores(
         vi=0.05, en=0.85, zh=0.10,
-        global_top_language="en", global_top_index=20, global_top_score=0.80, num_windows=1
+        global_top_language="en", global_top_index=20, global_top_score=0.80, num_windows=1,
+        vi_abs=0.02, en_abs=0.75, zh_abs=0.03,
     )
     assert confident_en.is_supported_top()
     assert confident_en.top_supported() == "en"
@@ -775,17 +911,49 @@ def test_voxlingua_scores_bootstrap_gate():
     # Narrow margin
     narrow = LanguageScores(
         vi=0.45, en=0.42, zh=0.13,
-        global_top_language="vi", global_top_index=102, global_top_score=0.40, num_windows=1
+        global_top_language="vi", global_top_index=102, global_top_score=0.40, num_windows=1,
+        vi_abs=0.30, en_abs=0.28, zh_abs=0.09,
     )
     assert not narrow.is_bootstrap_confident()
 
-    # Unsupported global top (Japanese)
+    # Unsupported global top (Japanese) with weak absolute ZH mass:
+    # relative ZH looks high, but abs(zh) ~= 0.05 stays far below the bar.
     ja_top = LanguageScores(
         vi=0.10, en=0.85, zh=0.05,
-        global_top_language="ja", global_top_index=45, global_top_score=0.80, num_windows=1
+        global_top_language="ja", global_top_index=45, global_top_score=0.80, num_windows=1,
+        vi_abs=0.01, en_abs=0.08, zh_abs=0.005,
     )
     assert not ja_top.is_supported_top()
     assert not ja_top.is_bootstrap_confident()
+
+
+def test_voxlingua_scores_short_window_waits_for_more_audio():
+    """600 ms EN window: rel en 0.997 but abs(en) ~= 0.12 -> NOT confident.
+
+    The old argmax rule rejected this window too, but for the wrong reason
+    (and then locked UND forever via the max-sticky smoother + VI fallback).
+    The new gate rejects on absolute mass and the growing window retries
+    with more audio instead of falling through to a VI guess.
+    """
+    from backend.streaming_asr.voxlingua import LanguageScores
+    short_en = LanguageScores(
+        vi=0.003, en=0.997, zh=0.0,
+        global_top_language="br", global_top_index=11, global_top_score=0.282,
+        num_windows=1,
+        vi_abs=0.0, en_abs=0.12, zh_abs=0.0,
+    )
+    assert not short_en.is_supported_top()
+    assert not short_en.is_bootstrap_confident()
+
+    # Same utterance at 1500 ms: abs(en) ~= 0.78 -> confident EN.
+    long_en = LanguageScores(
+        vi=0.0, en=1.0, zh=0.0,
+        global_top_language="en", global_top_index=20, global_top_score=0.78,
+        num_windows=1,
+        vi_abs=0.0, en_abs=0.78, zh_abs=0.0,
+    )
+    assert long_en.is_bootstrap_confident()
+    assert long_en.top_supported() == "en"
 
 
 def test_voxlingua_fbank_extractor():
@@ -818,22 +986,143 @@ def test_voxlingua_temporal_smoother():
     assert smoother.size == 0
 
     s1 = smoother.add(LanguageScores(vi=0.40, en=0.50, zh=0.10, global_top_language="en",
-                                     global_top_index=20, global_top_score=0.45, num_windows=1))
+                                     global_top_index=20, global_top_score=0.45, num_windows=1,
+                                     vi_abs=0.10, en_abs=0.12, zh_abs=0.02))
     assert smoother.size == 1
     assert s1.top_supported() == "en"
 
     s2 = smoother.add(LanguageScores(vi=0.20, en=0.75, zh=0.05, global_top_language="en",
-                                     global_top_index=20, global_top_score=0.70, num_windows=1))
+                                     global_top_index=20, global_top_score=0.70, num_windows=1,
+                                     vi_abs=0.08, en_abs=0.55, zh_abs=0.02))
     assert smoother.size == 2
 
     s3 = smoother.add(LanguageScores(vi=0.10, en=0.85, zh=0.05, global_top_language="en",
-                                     global_top_index=20, global_top_score=0.80, num_windows=1))
+                                     global_top_index=20, global_top_score=0.80, num_windows=1,
+                                     vi_abs=0.05, en_abs=0.70, zh_abs=0.02))
     assert smoother.size == 3
     assert s3.is_bootstrap_confident()
     assert s3.top_supported() == "en"
 
     smoother.reset()
     assert smoother.size == 0
+
+
+def test_voxlingua_smoother_unanimity_stamp():
+    """The smoother stamps unanimous=True only on a full agreeing depth."""
+    from backend.streaming_asr.voxlingua import VoxLinguaTemporalSmoother, LanguageScores
+
+    def win(top, rel, abs_v, gtop="nn", gscore=0.2):
+        scores = {"vi": 0.05, "en": 0.05, "zh": 0.05}
+        scores[top] = rel
+        s = sum(scores.values())
+        return LanguageScores(
+            vi=scores["vi"] / s, en=scores["en"] / s, zh=scores["zh"] / s,
+            global_top_language=gtop, global_top_index=69,
+            global_top_score=gscore, num_windows=1,
+            vi_abs=0.005 if top != "vi" else abs_v,
+            en_abs=0.005 if top != "en" else abs_v,
+            zh_abs=0.005 if top != "zh" else abs_v)
+
+    smoother = VoxLinguaTemporalSmoother()
+    assert smoother.add(win("en", 0.77, 0.010)).unanimous is False
+    assert smoother.add(win("en", 0.80, 0.015)).unanimous is False
+    third = smoother.add(win("en", 0.82, 0.012))
+    assert third.unanimous is True
+    # One dissenting window breaks unanimity.
+    fourth = smoother.add(win("vi", 0.70, 0.010))
+    assert fourth.unanimous is False
+
+
+def test_voxlingua_slow_gate_field_audio():
+    """Field-log regime (rel en ~0.77, abs ~0.01, weak nn top): fast gate
+    stays shut, slow gate opens after unanimity. A STRONG foreign argmax
+    (ja 0.85) still blocks the slow path."""
+    from backend.streaming_asr.voxlingua import LanguageScores
+
+    field = LanguageScores(
+        vi=0.176, en=0.769, zh=0.055,
+        global_top_language="nn", global_top_index=69, global_top_score=0.26,
+        num_windows=3, vi_abs=0.002, en_abs=0.010, zh_abs=0.001,
+        unanimous=True)
+    assert not field.is_bootstrap_confident()
+    assert field.is_slow_bootstrap_confident()
+
+    ja = LanguageScores(
+        vi=0.05, en=0.10, zh=0.85,
+        global_top_language="ja", global_top_index=45, global_top_score=0.85,
+        num_windows=3, vi_abs=0.005, en_abs=0.008, zh_abs=0.05,
+        unanimous=True)
+    assert not ja.is_slow_bootstrap_confident()
+
+    not_yet = LanguageScores(
+        vi=0.176, en=0.769, zh=0.055,
+        global_top_language="nn", global_top_index=69, global_top_score=0.26,
+        num_windows=1, vi_abs=0.002, en_abs=0.010, zh_abs=0.001,
+        unanimous=False)
+    assert not not_yet.is_slow_bootstrap_confident()
+
+
+def test_bootstrap_slow_path_commits_through_engine():
+    """End-to-end slow path: three field-like windows through the real
+    smoother + classify_bootstrap commit EN with relative confidence."""
+    from backend.streaming_asr.lid import LanguageIdEngine
+    from backend.streaming_asr.voxlingua import (
+        LanguageScores, VoxLinguaTemporalSmoother)
+
+    smoother = VoxLinguaTemporalSmoother()
+
+    def field_window(rel_en):
+        return LanguageScores(
+            vi=0.176, en=rel_en, zh=0.055,
+            global_top_language="nn", global_top_index=69,
+            global_top_score=0.26, num_windows=1,
+            vi_abs=0.002, en_abs=0.010, zh_abs=0.001)
+
+    ema = None
+    for rel in (0.769, 0.80, 0.82):
+        ema = smoother.add(field_window(rel))
+    assert ema.unanimous is True
+
+    class MockDetailedEngine:
+        def classify_detailed(self, audio):
+            return ema
+
+        def classify(self, audio):
+            return ema.to_map()
+
+        def is_ready(self):
+            return True
+
+    lid = LanguageIdEngine(acoustic_scorer=MockDetailedEngine())
+    r = lid.classify_bootstrap([0.1] * 4800)
+    assert r.language == "en"
+    assert r.confidence >= 0.70
+    # Confidence is the relative top (no fusion compression vs router gate).
+    assert abs(r.confidence - ema.top_supported_score()) < 1e-9
+
+
+def test_voxlingua_smoother_noisy_window_does_not_jam():
+    """A noisy high-score first window must not lock later windows out.
+
+    Old max-sticky rule kept `lo 0.474` as the global top for the whole
+    utterance, so is_supported_top() stayed False forever. Now the global
+    top follows the latest window and the gate reads absolute mass.
+    """
+    from backend.streaming_asr.voxlingua import VoxLinguaTemporalSmoother, LanguageScores
+
+    smoother = VoxLinguaTemporalSmoother()
+    first = smoother.add(LanguageScores(
+        vi=0.08, en=0.92, zh=0.0, global_top_language="lo",
+        global_top_index=55, global_top_score=0.474, num_windows=1,
+        vi_abs=0.01, en_abs=0.20, zh_abs=0.0))
+    assert not first.is_bootstrap_confident()
+
+    second = smoother.add(LanguageScores(
+        vi=0.0, en=1.0, zh=0.0, global_top_language="en",
+        global_top_index=20, global_top_score=0.78, num_windows=1,
+        vi_abs=0.0, en_abs=0.78, zh_abs=0.0))
+    assert second.global_top_language == "en"
+    assert second.is_bootstrap_confident()
 
 
 def test_voxlingua_scores_from_logits():
@@ -888,20 +1177,24 @@ def test_language_id_engine_voxlingua_integration():
         def is_ready(self):
             return True
 
-    # 1. Unsupported global winner -> UND flat
+    # 1. Unsupported global winner with weak absolute mass -> UND flat.
+    # (The gate reads absolute mass, not the argmax label.)
     ja_scorer = MockDetailedEngine(
         LanguageScores(vi=0.80, en=0.15, zh=0.05, global_top_language="ja",
-                       global_top_index=45, global_top_score=0.85, num_windows=1)
+                       global_top_index=45, global_top_score=0.85, num_windows=1,
+                       vi_abs=0.10, en_abs=0.02, zh_abs=0.005)
     )
     lid_ja = LanguageIdEngine(acoustic_scorer=ja_scorer)
     r_ja = lid_ja.classify_bootstrap([0.1] * 4800)
     assert r_ja.language == "und"
     assert abs(r_ja.scores["vi"] - 1.0 / 3) < 1e-5
 
-    # 2. Confident EN -> EN commits
+    # 2. Confident EN (strong absolute mass) -> EN commits, even when the
+    # 107-class argmax is an unrelated language (short-window case).
     en_scorer = MockDetailedEngine(
-        LanguageScores(vi=0.05, en=0.90, zh=0.05, global_top_language="en",
-                       global_top_index=20, global_top_score=0.88, num_windows=1)
+        LanguageScores(vi=0.05, en=0.90, zh=0.05, global_top_language="br",
+                       global_top_index=11, global_top_score=0.30, num_windows=1,
+                       vi_abs=0.01, en_abs=0.50, zh_abs=0.005)
     )
     lid_en = LanguageIdEngine(acoustic_scorer=en_scorer)
     r_en = lid_en.classify_bootstrap([0.1] * 4800)

@@ -19,6 +19,9 @@ import numpy as np
 from .config import (
     BOOTSTRAP_THRESHOLD,
     BOOTSTRAP_MARGIN,
+    LID_EMA_ALPHA,
+    VOXLINGUA_FOREIGN_TOP_REJECT,
+    VOXLINGUA_MIN_SUPPORTED_ABS_SCORE,
     VOXLINGUA_N_MELS,
     VOXLINGUA_MIN_GLOBAL_SCORE,
     VOXLINGUA_MODEL,
@@ -76,7 +79,15 @@ class VoxLinguaLabels:
 
 @dataclass
 class LanguageScores:
-    """VoxLingua bootstrap and runtime score carrier (§31)."""
+    """VoxLingua bootstrap and runtime score carrier (§31).
+
+    vi/en/zh are SUPPORTED-RELATIVE posteriors (renormalized among the
+    three, sum ≈ 1) used for the 0.70/0.15 relative gate. vi_abs/en_abs/zh_abs
+    are ABSOLUTE 107-way posteriors (sum with the other 104 classes ≈ 1) used
+    for the absolute-evidence gate: on short windows the 107-class argmax is
+    regularly an unrelated language while the relative evidence is already
+    decisive, so the gate must read absolute mass, not the argmax label.
+    """
 
     vi: float
     en: float
@@ -85,6 +96,13 @@ class LanguageScores:
     global_top_index: int
     global_top_score: float
     num_windows: int = 1
+    vi_abs: float = 0.0
+    en_abs: float = 0.0
+    zh_abs: float = 0.0
+    # Smoother-stamped flag (2026-09-16 v2): True when the smoother's full
+    # depth of raw windows unanimously agrees on the supported top. Set by
+    # VoxLinguaTemporalSmoother.add only — never by the engine.
+    unanimous: bool = False
 
     @classmethod
     def flat(cls) -> "LanguageScores":
@@ -96,6 +114,9 @@ class LanguageScores:
             global_top_index=-1,
             global_top_score=1.0 / 107,
             num_windows=0,
+            vi_abs=1.0 / 107,
+            en_abs=1.0 / 107,
+            zh_abs=1.0 / 107,
         )
 
     def is_supported_top(self) -> bool:
@@ -125,13 +146,52 @@ class LanguageScores:
             return max(self.vi, self.zh)
         return max(self.vi, self.en)
 
-    def is_bootstrap_confident(self) -> bool:
-        """Bootstrap gate (§15): top >= 0.70, top - second >= 0.15, supported global top."""
-        if not self.is_supported_top():
-            return False
+    def top_supported_abs(self) -> float:
+        top = self.top_supported()
+        if top == "vi":
+            return self.vi_abs
+        if top == "en":
+            return self.en_abs
+        return self.zh_abs
+
+    def _relative_gate(self) -> bool:
+        """Shared relative part: top >= 0.70 AND top - second >= 0.15."""
         top = self.top_supported_score()
         second = self.second_supported_score()
-        return (top >= BOOTSTRAP_THRESHOLD) and ((top - second) >= BOOTSTRAP_MARGIN)
+        return (top >= BOOTSTRAP_THRESHOLD) and (
+            (top - second) >= BOOTSTRAP_MARGIN)
+
+    def is_bootstrap_confident(self) -> bool:
+        """FAST bootstrap gate (§15, 2026-09-16 fix).
+
+        Relative gate PLUS absolute posterior mass (replaces the old
+        "107-class argmax must be en/vi/zh" rule). Commits clean audio
+        quickly; on noisy device-mic audio the absolute mass stays tiny and
+        the SLOW path below takes over instead.
+        """
+        if not self._relative_gate():
+            return False
+        return self.top_supported_abs() >= VOXLINGUA_MIN_SUPPORTED_ABS_SCORE
+
+    def is_slow_bootstrap_confident(self) -> bool:
+        """SLOW bootstrap gate (2026-09-16 v2, field-log fix).
+
+        Device-mic audio yields flat 107-way distributions (supported abs
+        ≈ 0.01) with a CORRECT relative ranking — the absolute bar never
+        opens there. The slow path trusts the relative gate once a full
+        smoother depth UNANIMOUSLY agrees (single-window flips, which do
+        happen in both directions, cannot commit alone). Residue of the §14
+        policy: a STRONG unsupported argmax still blocks (true foreign
+        audio waits); weak/flat argmax tops do not.
+        """
+        if not self.unanimous:
+            return False
+        if not self._relative_gate():
+            return False
+        if (not self.is_supported_top()
+                and self.global_top_score >= VOXLINGUA_FOREIGN_TOP_REJECT):
+            return False
+        return True
 
     def to_map(self) -> Dict[str, float]:
         return {"vi": self.vi, "en": self.en, "zh": self.zh}
@@ -223,7 +283,18 @@ class VoxLinguaFbankExtractor:
 
 
 class VoxLinguaTemporalSmoother:
-    """Temporal smoothing across rolling windows (depth=3, alpha=0.5, majority vote) (§16)."""
+    """Temporal smoothing across rolling windows (§16).
+
+    Fuses the last N window results with EMA (relative + absolute supported
+    posteriors) plus a majority-vote stabilizer on the relative top.
+
+    2026-09-16 fix: the global-top label now FOLLOWS THE LATEST window. The
+    old "keep the highest score ever seen" rule latched one noisy window
+    (e.g. `lo 0.474` at 400 ms) and locked the whole utterance to UND, since
+    later lower-scoring windows could never replace it. The bootstrap gate no
+    longer reads the argmax label (it reads absolute mass), so a single noisy
+    window can no longer jam the pipeline.
+    """
 
     DEFAULT_DEPTH = 3
     DEFAULT_ALPHA = 0.5
@@ -242,17 +313,24 @@ class VoxLinguaTemporalSmoother:
         if self.ema is None:
             self.ema = raw
         else:
-            vi = self.alpha * raw.vi + (1 - self.alpha) * self.ema.vi
-            en = self.alpha * raw.en + (1 - self.alpha) * self.ema.en
-            zh = self.alpha * raw.zh + (1 - self.alpha) * self.ema.zh
+            a = self.alpha
+            vi = a * raw.vi + (1 - a) * self.ema.vi
+            en = a * raw.en + (1 - a) * self.ema.en
+            zh = a * raw.zh + (1 - a) * self.ema.zh
+            vi_abs = a * raw.vi_abs + (1 - a) * self.ema.vi_abs
+            en_abs = a * raw.en_abs + (1 - a) * self.ema.en_abs
+            zh_abs = a * raw.zh_abs + (1 - a) * self.ema.zh_abs
 
-            g_top = self.ema.global_top_language
-            g_idx = self.ema.global_top_index
-            g_score = self.ema.global_top_score
-            if raw.num_windows > 0 and raw.global_top_score >= self.ema.global_top_score:
+            # Follow the latest window's global top (never latch the max:
+            # that locked UND for the whole utterance on one noisy window).
+            if raw.num_windows > 0:
                 g_top = raw.global_top_language
                 g_idx = raw.global_top_index
                 g_score = raw.global_top_score
+            else:
+                g_top = self.ema.global_top_language
+                g_idx = self.ema.global_top_index
+                g_score = self.ema.global_top_score
 
             self.ema = LanguageScores(
                 vi=vi,
@@ -262,11 +340,14 @@ class VoxLinguaTemporalSmoother:
                 global_top_index=g_idx,
                 global_top_score=g_score,
                 num_windows=self.ema.num_windows + 1,
+                vi_abs=vi_abs,
+                en_abs=en_abs,
+                zh_abs=zh_abs,
             )
 
         if len(self.history) >= self.depth:
             vote = self._majority_top()
-            if vote and vote == self.ema.top_supported() and self.ema.is_supported_top():
+            if vote and vote == self.ema.top_supported():
                 boost = 0.05
                 vi = self.ema.vi + (boost if vote == "vi" else 0.0)
                 en = self.ema.en + (boost if vote == "en" else 0.0)
@@ -280,7 +361,16 @@ class VoxLinguaTemporalSmoother:
                     global_top_index=self.ema.global_top_index,
                     global_top_score=self.ema.global_top_score,
                     num_windows=self.ema.num_windows,
+                    vi_abs=self.ema.vi_abs,
+                    en_abs=self.ema.en_abs,
+                    zh_abs=self.ema.zh_abs,
                 )
+
+        # Stamp unanimity for the SLOW bootstrap gate (2026-09-16 v2): a full
+        # depth of raw windows agreeing on the supported top. The majority
+        # boost above never changes history, so this stays exact.
+        self.ema.unanimous = (
+            len(self.history) >= self.depth and self._all_agree())
 
         return self.ema
 
@@ -306,6 +396,11 @@ class VoxLinguaTemporalSmoother:
             if count >= need:
                 return lang
         return None
+
+    def _all_agree(self) -> bool:
+        """True when every buffered raw window shares one supported top."""
+        tops = {s.top_supported() for s in self.history}
+        return len(tops) == 1
 
 
 def scores_from_logits(logits: np.ndarray | list) -> LanguageScores:
@@ -343,6 +438,9 @@ def scores_from_logits(logits: np.ndarray | list) -> LanguageScores:
         global_top_index=top_idx,
         global_top_score=top_score,
         num_windows=1,
+        vi_abs=p_vi,
+        en_abs=p_en,
+        zh_abs=p_zh,
     )
 
 
@@ -353,7 +451,8 @@ class VoxLinguaAcousticLidEngine:
 
     def __init__(self, model_path: Optional[str | Path] = None):
         self.fbank = VoxLinguaFbankExtractor()
-        self.smoother = VoxLinguaTemporalSmoother()
+        self.smoother = VoxLinguaTemporalSmoother(
+            alpha=LID_EMA_ALPHA)
         self.session = None
         self.feature_input = None
         self.wav_lens_input = None
@@ -411,6 +510,7 @@ class VoxLinguaAcousticLidEngine:
         self.smoother.reset()
 
     def smoothed(self) -> LanguageScores:
+        """Last smoothed aggregate (mirrors AcousticLidEngine.smoothed)."""
         return self.smoother.smoothed()
 
     def _infer_raw(self, audio) -> LanguageScores:

@@ -247,36 +247,44 @@ adb logcat -s HyMtGgufJNI TranslationModule PipelineOrchestrator StreamingPipeli
 
 ## Known Issues & Limitations (streaming ASR)
 
-Device-validated unless noted; logic gates (`test_07`, 36 tests, bench A–D) green.
+Logic gates (`test_07`, 51 tests, bench A–D) green; **on-device VoxLingua LID
+is an incomplete implementation — field validation and threshold tuning are
+still open (see 1–3).**
 
-1. **UNKNOWN loop without an acoustic LID model (open, root cause known).**
-   Every utterance starts `UND` and bootstrap LID must commit from audio
-   alone — but the interim heuristic is capped below the 0.70 gate by
-   design, so all traffic falls into the dual-candidate fallback. That
-   fallback decodes a **cold 400 ms window with no drain decodes**, which on
-   the real streaming Zipformer almost always yields empty hypotheses →
-   `speculative candidates inconclusive, staying UNKNOWN` repeats, endpoint
-   finalizes empty, and full English sentences produce no output (only
-   dictionary-strong tokens like `HELLO` escape via the single-unit lexical
-   exception). Landed mitigations (in this tree, device retest pending):
-   provisional VI speculative decode while UNKNOWN with adopt-or-rollback on
-   commit, rotating candidate pairs, endpoint backstop (pair → leftover →
-   full-utterance verification). Remaining plan: feed candidates up to ~2 s
-   of left-context + drain loop, then retune the 0.35/0.30/0.50 bars down
-   (gated by the anti-garbage tests). A trained tiny LID remains the real
-   fix (roadmap in `docs/streaming_asr.md`).
-2. **sherpa `GetFrames` race → native crash (open, fix planned).** Observed
-   once after long use: `features.cc:GetFrames:188 / 6208 + 45 > 6248`
-   (fatal, uncatchable) → `Channel is unrecoverably broken` → process death.
-   Cause: `OnlineStream` is not thread-safe, but the audio thread
-   (`decodeChunk`/`decodeProvisional`/endpoint) and the LID worker
-   (`onCommitted`/`activateBootstrap`/`verifyCandidate`) touch the shared
-   resident engines concurrently. Planned fix: serialize all engine access
-   behind one lock (no thread-architecture change). Not observed in the
-   16:46 session below (clean stop, no `GetFrames` warning).
-3. **Full-English accuracy still weak (open).** Short EN works through the VI
-   model (`YOU` @0.47 → translated `BẠN.`), but fluent EN sentences end
-   UNKNOWN/empty per (1). Same remediation as (1).
+1. **VoxLingua LID bootstrap: incomplete, under field validation (open).**
+    Diagnosed in `docs/voxlingua_lid_diagnosis.md` (v1 + v2 field logs): the
+    fixed 600 ms window sat below the ECAPA evidence point, the 107-class
+    argmax gate rejected every short-window EN/ZH result, and the 0.30
+    candidate bar committed Vietnamese on no evidence. Current state (this
+    tree, NOT yet proven on-device): growing onset-anchored window (1500 ms
+    live cap, 2500 ms at endpoints), two-tier gate — FAST (absolute mass
+    `≥ 0.45`) for clean audio, SLOW (relative `0.70/0.15` + 3-hop unanimity +
+    foreign-argmax guard) for noisy device-mic audio where supported abs sits
+    at ~0.01 with a correct relative ranking. The 2026-09-16 field log showed
+    exactly that regime (`en-rel 0.77–0.87`, `enAbs 0.01–0.02` → UNKNOWN
+    forever under the abs-only bar). Follow-latest smoother,
+    evidence-steered provisional (switch-to-resident / quiet), candidate bar
+    `0.65 + 0.10` with non-VI-first tie-break, and a post-weak-commit
+    acoustic referee round out the pipeline. Remaining: confirm commit
+    latency/accuracy on real VI/EN/ZH speech, then tune
+    (`VOXLINGUA_MIN_SUPPORTED_ABS_SCORE`, `FOREIGN_TOP_REJECT`, windows) on
+    measured device distributions — clean-sample numbers do NOT transfer.
+2. **sherpa `GetFrames` race → native crash (fix landed, soak retest
+    pending).** Observed once after long use: `features.cc:GetFrames:188 /
+    6208 + 45 > 6248` (fatal, uncatchable) → `Channel is unrecoverably
+    broken` → process death. Cause: `OnlineStream` is not thread-safe, but
+    the audio thread and the LID worker touched the shared resident engines
+    concurrently. Fix in this tree: every engine call in `StreamingPipeline`
+    is serialized on one leaf lock (`engineLock`, no thread-architecture
+    change — live decode, bootstrap replay, candidate shadow decodes,
+    endpoint verification, flushes and finals all go through it).
+3. **Full-English accuracy still weak (open, same remediation as 1).**
+    Short EN works through the VI model (`YOU` @0.47 → translated `BẠN.`),
+    but fluent EN sentences end UNKNOWN/empty while bootstrap stays
+    uncommitted. A 2026-09-16 field session also showed a late false VI
+    commit (`adopted provisional vi conf=0.79` on English audio) — single
+    windows can flip either way, which is why the slow path requires
+    unanimity instead of just a lower bar.
 4. **Endpoint trade-off (2000 ms silence).** Natural pauses no longer split
    sentences, but hands-free finals arrive ~2 s after speech stops (plus
    translation). Tapping Stop flushes immediately.
@@ -302,6 +310,22 @@ Device-validated unless noted; logic gates (`test_07`, 36 tests, bench A–D) gr
 9. **Upstream caveat.** ORT 1.27.0 is reported to miscompute the zipformer2
    int8 encoder on Snapdragon 8 Elite Gen 5 (k2-fsa/sherpa-onnx#3845);
    fixed upstream in 1.28.0, which no sherpa Android release bundles yet.
+
+### Field-log notes 2026-09-16 (pid 12666, OnePlus/Oppo device, post-v1 APK)
+
+- VoxLingua session loads fine (`featureInput=features wavLensInput=wav_lens
+  outputs=[probabilities]`), but live inferences report flat 107-way mass
+  with correct relative ranking (`en 0.77–0.87`, `enAbs 0.01–0.02`,
+  `globalTop=nn 0.09–0.26`) → abs-only gate never opens → `speculative
+  candidates inconclusive, staying UNKNOWN` repeats → empty finals. This
+  motivated the v2 slow path (relative + unanimity).
+- One utterance committed a late false VI (`adopted provisional vi
+  conf=0.79` on English audio, final `HEO.` → translated) — single-window
+  evidence flips both ways; persistence is required, not just a lower bar.
+- End-to-end cost in this log (`Pipeline total: 2661 ms = Translation
+  737 ms + TTS 1787 ms`, plus the 2000 ms endpoint silence) sits mostly
+  outside ASR once commits flow early again; MT/TTS are the next latency
+  lever after LID accuracy.
 
 ### Field-log notes 2026-09-14 (build pid 485, OnePlus/Oppo device)
 

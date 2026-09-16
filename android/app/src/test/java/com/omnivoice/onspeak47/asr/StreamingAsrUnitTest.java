@@ -369,25 +369,42 @@ public class StreamingAsrUnitTest {
         assertFalse(flat.isSupportedTop());
         assertFalse(flat.isBootstrapConfident());
 
-        // Confident VI with supported global winner.
+        // Confident VI with strong absolute mass.
         LanguageScores confidentVi = new LanguageScores(0.82f, 0.13f, 0.05f,
-                "vi", 102, 0.75f, 1);
+                0.75f, 0.03f, 0.01f, "vi", 102, 0.75f, 1);
         assertTrue(confidentVi.isSupportedTop());
         assertEquals(AsrLanguage.VI, confidentVi.topSupported());
         assertTrue(confidentVi.isBootstrapConfident());
 
         // Supported but margin too narrow (< 0.15).
         LanguageScores narrow = new LanguageScores(0.46f, 0.43f, 0.11f,
-                "vi", 102, 0.40f, 1);
+                0.30f, 0.28f, 0.09f, "vi", 102, 0.40f, 1);
         assertTrue(narrow.isSupportedTop());
         assertFalse(narrow.isBootstrapConfident());
 
-        // Unsupported global winner (e.g. Japanese): relative score looks high
-        // among VI/EN/ZH, but global winner is NOT supported -> must NOT commit.
-        LanguageScores jaWinner = new LanguageScores(0.82f, 0.13f, 0.05f,
-                "ja", 45, 0.85f, 1);
+        // Unsupported global winner (e.g. Japanese) with weak absolute mass:
+        // relative ZH looks high, but abs(zh) ~= 0.005 stays far below the bar.
+        LanguageScores jaWinner = new LanguageScores(0.10f, 0.85f, 0.05f,
+                0.01f, 0.08f, 0.005f, "ja", 45, 0.85f, 1);
         assertFalse(jaWinner.isSupportedTop());
         assertFalse(jaWinner.isBootstrapConfident());
+    }
+
+    @Test
+    public void voxLinguaScores_shortWindowWaitsForMoreAudio() {
+        // 600 ms EN window: rel en 0.997 but abs(en) ~= 0.12 -> NOT confident.
+        // The gate rejects on absolute mass (not the argmax label) and the
+        // growing window retries with more audio instead of guessing VI.
+        LanguageScores shortEn = new LanguageScores(0.003f, 0.997f, 0.0f,
+                0.0f, 0.12f, 0.0f, "br", 11, 0.282f, 1);
+        assertFalse(shortEn.isSupportedTop());
+        assertFalse(shortEn.isBootstrapConfident());
+
+        // Same utterance at 1500 ms: abs(en) ~= 0.78 -> confident EN.
+        LanguageScores longEn = new LanguageScores(0.0f, 1.0f, 0.0f,
+                0.0f, 0.78f, 0.0f, "en", 20, 0.78f, 1);
+        assertTrue(longEn.isBootstrapConfident());
+        assertEquals(AsrLanguage.EN, longEn.topSupported());
     }
 
     @Test
@@ -425,18 +442,18 @@ public class StreamingAsrUnitTest {
 
         // Window 1: uncertain leaning EN.
         LanguageScores s1 = smoother.add(new LanguageScores(0.43f, 0.49f, 0.08f,
-                "en", 20, 0.40f, 1));
+                0.10f, 0.12f, 0.02f, "en", 20, 0.40f, 1));
         assertEquals(1, smoother.size());
         assertEquals(AsrLanguage.EN, s1.topSupported());
 
         // Window 2: strong EN.
         LanguageScores s2 = smoother.add(new LanguageScores(0.22f, 0.72f, 0.06f,
-                "en", 20, 0.65f, 1));
+                0.08f, 0.55f, 0.02f, "en", 20, 0.65f, 1));
         assertEquals(2, smoother.size());
 
         // Window 3: dominant EN (3 consecutive windows agreement -> majority vote boost).
         LanguageScores s3 = smoother.add(new LanguageScores(0.12f, 0.82f, 0.06f,
-                "en", 20, 0.75f, 1));
+                0.05f, 0.70f, 0.02f, "en", 20, 0.75f, 1));
         assertEquals(3, smoother.size());
         assertTrue(s3.isBootstrapConfident());
         assertEquals(AsrLanguage.EN, s3.topSupported());
@@ -444,6 +461,62 @@ public class StreamingAsrUnitTest {
         smoother.reset();
         assertEquals(0, smoother.size());
         assertFalse(smoother.smoothed().isSupportedTop());
+    }
+
+    @Test
+    public void voxLinguaSmoother_unanimityStamp() {
+        // Unanimous flag needs a FULL agreeing depth; one dissenter clears it.
+        VoxLinguaTemporalSmoother smoother = new VoxLinguaTemporalSmoother();
+        assertFalse(smoother.add(fieldWindow(0.77f)).unanimous);
+        assertFalse(smoother.add(fieldWindow(0.80f)).unanimous);
+        assertTrue(smoother.add(fieldWindow(0.82f)).unanimous);
+        LanguageScores dissent = new LanguageScores(0.70f, 0.20f, 0.10f,
+                0.010f, 0.005f, 0.005f, "nn", 69, 0.20f, 1);
+        assertFalse(smoother.add(dissent).unanimous);
+    }
+
+    /** Field-log regime window: rel en ~0.77, abs ~0.01, weak nn top. */
+    private static LanguageScores fieldWindow(float relEn) {
+        return new LanguageScores(0.176f, relEn, 0.055f,
+                0.002f, 0.010f, 0.001f, "nn", 69, 0.26f, 1);
+    }
+
+    @Test
+    public void voxLinguaSlowGate_fieldAudio() {
+        // Fast gate stays shut on flat absolute mass...
+        VoxLinguaTemporalSmoother smoother = new VoxLinguaTemporalSmoother();
+        smoother.add(fieldWindow(0.769f));
+        smoother.add(fieldWindow(0.80f));
+        LanguageScores ema = smoother.add(fieldWindow(0.82f));
+        assertTrue(ema.unanimous);
+        assertFalse(ema.isBootstrapConfident());
+        // ...but the slow path (unanimous relative + weak argmax) opens.
+        assertTrue(ema.isSlowBootstrapConfident());
+
+        // A STRONG foreign argmax still blocks the slow path (true foreign).
+        LanguageScores ja = new LanguageScores(0.05f, 0.10f, 0.85f,
+                0.005f, 0.008f, 0.05f, "ja", 45, 0.85f, 1);
+        ja.unanimous = true;
+        assertFalse(ja.isSlowBootstrapConfident());
+
+        // Without unanimity the slow path stays shut.
+        LanguageScores early = fieldWindow(0.769f);
+        assertFalse(early.isSlowBootstrapConfident());
+    }
+
+    @Test
+    public void voxLinguaSmoother_noisyWindowDoesNotJam() {
+        // A noisy high-score first window must not lock later windows out.
+        // The old max-sticky rule kept `lo 0.474` for the whole utterance.
+        VoxLinguaTemporalSmoother smoother = new VoxLinguaTemporalSmoother();
+        LanguageScores first = smoother.add(new LanguageScores(
+                0.08f, 0.92f, 0.0f, 0.01f, 0.20f, 0.0f, "lo", 55, 0.474f, 1));
+        assertFalse(first.isBootstrapConfident());
+
+        LanguageScores second = smoother.add(new LanguageScores(
+                0.0f, 1.0f, 0.0f, 0.0f, 0.78f, 0.0f, "en", 20, 0.78f, 1));
+        assertEquals("en", second.globalTopLanguage);
+        assertTrue(second.isBootstrapConfident());
     }
 
     @Test
@@ -489,7 +562,8 @@ public class StreamingAsrUnitTest {
 
     @Test
     public void languageIdEngine_voxLinguaDetailedIntegration() {
-        // Mock detailed engine returning unsupported Japanese top.
+        // Mock detailed engine returning unsupported Japanese top with weak
+        // absolute mass -> UND flat (the gate reads absolute mass, not argmax).
         AcousticLidEngine jaEngine = new AcousticLidEngine() {
             @Override
             public Map<AsrLanguage, Float> classify(float[] audioWindow) {
@@ -498,16 +572,18 @@ public class StreamingAsrUnitTest {
 
             @Override
             public LanguageScores classifyDetailed(float[] audioWindow) {
-                return new LanguageScores(0.80f, 0.15f, 0.05f, "ja", 45, 0.85f, 1);
+                return new LanguageScores(0.80f, 0.15f, 0.05f,
+                        0.10f, 0.02f, 0.005f, "ja", 45, 0.85f, 1);
             }
         };
         LanguageIdEngine lidJa = new LanguageIdEngine(jaEngine, AsrState.EMA_ALPHA);
         LanguageIdEngine.LidResult resJa = lidJa.classifyBootstrap(new float[4800]);
-        // Unsupported global top must map to UND and flat scores.
+        // Weak absolute evidence must map to UND and flat scores.
         assertEquals(AsrLanguage.UND, resJa.language);
         assertEquals(1.0f / 3, resJa.scores.get(AsrLanguage.VI), 1e-5f);
 
-        // Mock detailed engine returning confident EN.
+        // Mock detailed engine returning confident EN even though the
+        // 107-class argmax is an unrelated language (short-window case).
         AcousticLidEngine enEngine = new AcousticLidEngine() {
             @Override
             public Map<AsrLanguage, Float> classify(float[] audioWindow) {
@@ -516,13 +592,36 @@ public class StreamingAsrUnitTest {
 
             @Override
             public LanguageScores classifyDetailed(float[] audioWindow) {
-                return new LanguageScores(0.05f, 0.90f, 0.05f, "en", 20, 0.88f, 1);
+                return new LanguageScores(0.05f, 0.90f, 0.05f,
+                        0.01f, 0.50f, 0.005f, "br", 11, 0.30f, 1);
             }
         };
         LanguageIdEngine lidEn = new LanguageIdEngine(enEngine, AsrState.EMA_ALPHA);
         LanguageIdEngine.LidResult resEn = lidEn.classifyBootstrap(new float[4800]);
         assertEquals(AsrLanguage.EN, resEn.language);
         assertTrue(resEn.confidence >= AsrState.BOOTSTRAP_THRESHOLD);
+
+        // Slow path: unanimous field-regime scores commit EN with the
+        // relative confidence (no fusion compression vs the router gate).
+        final LanguageScores slowEma = new LanguageScores(
+                0.168f, 0.812f, 0.052f, 0.002f, 0.010f, 0.001f,
+                "nn", 69, 0.26f, 3);
+        slowEma.unanimous = true;
+        AcousticLidEngine slowEngine = new AcousticLidEngine() {
+            @Override
+            public Map<AsrLanguage, Float> classify(float[] audioWindow) {
+                return classifyDetailed(audioWindow).toMap();
+            }
+
+            @Override
+            public LanguageScores classifyDetailed(float[] audioWindow) {
+                return slowEma;
+            }
+        };
+        LanguageIdEngine lidSlow = new LanguageIdEngine(slowEngine, AsrState.EMA_ALPHA);
+        LanguageIdEngine.LidResult resSlow = lidSlow.classifyBootstrap(new float[4800]);
+        assertEquals(AsrLanguage.EN, resSlow.language);
+        assertEquals(0.812f, resSlow.confidence, 1e-6f);
 
         // Three-level interval.
         assertEquals(AsrState.LID_INTERVAL_CANDIDATE_MS,

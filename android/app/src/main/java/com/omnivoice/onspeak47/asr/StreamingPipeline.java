@@ -83,19 +83,58 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     private volatile long lastCandidateRunSpeechMs = -1;
     /** Last speculative pair tried (rotation covers the 3rd language). */
     private volatile AsrLanguage[] lastCandidatePair = null;
+    /**
+     * Confidence of the decision that activated the current language. While
+     * it stays below BOOTSTRAP_THRESHOLD the acoustic referee keeps running
+     * (§6.1 Referee Mode) so a weak early commit can still be corrected; a
+     * solid commit turns the referee off and only the cheap 480 ms runtime
+     * LID remains.
+     */
+    private volatile float bootstrapCommitConfidence = 0f;
+    /** Bootstrap/referee classifies submitted this utterance (§6.1, CPU bound). */
+    private volatile int refereeAttempts = 0;
+    /** utteranceSpeechMs at the last referee submit (speech-gated cadence). */
+    private volatile long lastRefereeSpeechMs = -1;
+    /** Latest bootstrap LidResult for this utterance (candidate retries reuse
+     *  its ranking after the ECAPA budget is spent — never a fresh guess). */
+    private volatile LanguageIdEngine.LidResult lastBootstrapResult = null;
+
+    /**
+     * Serializes ALL streaming-engine calls (acceptAudio / decodeAvailable /
+     * getPartialResult / reset). OnlineStream is not thread-safe, but the
+     * audio thread (live decode + provisional) and the LID worker (bootstrap
+     * replay, candidate shadow decodes, endpoint verification) share the
+     * resident engines — unsynchronized access crashed the process in
+     * GetFrames (fatal native abort, uncatchable). Always a LEAF lock: never
+     * acquire `this` or the router monitor while holding it.
+     */
+    private final Object engineLock = new Object();
 
     // --- Provisional speculative decode (Option A hotfix) ---
-    // While UNKNOWN the pipeline ALSO decodes continuously on one provisional
-    // model (VI, always resident) so partials flow after ~160 ms like the old
-    // system. Provisional output is SPECULATIVE-only: it lives in
-    // provisionalSpeculative (never the shared transcript manager), is
-    // adopted without replay when bootstrap confirms the same language, and
-    // is discarded without a trace otherwise (§11: nothing committed before
-    // the language is confirmed).
+    // While UNKNOWN the pipeline ALSO decodes continuously so partials flow
+    // after ~160 ms like the old system. It starts on the always-resident VI
+    // engine, but uncertain LID evidence steers it (2026-09-16 §6.2): a
+    // persistent lean to a resident engine moves the stream there, a lean to
+    // a non-resident engine quiets the UI instead of showing VI-decoded
+    // guesses for foreign audio. Provisional output is SPECULATIVE-only: it
+    // lives in provisionalSpeculative (never the shared transcript manager),
+    // is adopted without replay when bootstrap confirms the same language on
+    // a complete stream, and is discarded without a trace otherwise (§11:
+    // nothing committed before the language is confirmed).
     private volatile StreamingAsrEngine provisionalAsr;
     private volatile AsrLanguage provisionalLang = AsrLanguage.VI;
     private volatile String provisionalSpeculative = "";
     private volatile float provisionalConf = 0.33f;
+    /** Set while foreign-leaning evidence hides VI-guess text (decode runs on). */
+    private volatile boolean provisionalQuiet = false;
+    /** False after a mid-utterance engine switch: the stream missed the head
+     *  audio, so a commit to this language must replay (no adopt). */
+    private volatile boolean provisionalComplete = true;
+    /** Worker→audio handoff for a provisional engine switch (never lazy-load
+     *  on the worker: the audio thread resolves it). */
+    private volatile AsrLanguage pendingProvisionalLang = null;
+    /** Top language of the previous uncertain result (switch needs 2 hops). */
+    private volatile AsrLanguage lastUncertainTop = null;
     /** Last provisional text already posted to UI (dedup: the transducer
      *  re-emits the same hypothesis every 160 ms — re-posting it only
      *  churns the UI without new information). The decode itself still
@@ -206,6 +245,10 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         lastLidMs = 0;
         utteranceSpeechMs = 0;
         lastBootstrapSpeechMs = -1;
+        bootstrapCommitConfidence = 0f;
+        refereeAttempts = 0;
+        lastRefereeSpeechMs = -1;
+        lastBootstrapResult = null;
         lastCandidateRunSpeechMs = -1;
         lastCandidatePair = null;
         bootstrapPending = false;
@@ -235,7 +278,11 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         // included, so a deliberate Stop never drops tail words).
         if (activeAsr != null) {
             flushScheduler();
-            StreamingAsrEngine.PartialResult fin = activeAsr.getFinalResult();
+            final StreamingAsrEngine eng = activeAsr;
+            final StreamingAsrEngine.PartialResult fin;
+            synchronized (engineLock) {
+                fin = eng.getFinalResult();
+            }
             transcripts.finalizeTranscript(mergeDisplay(fin.text));
             postFinal(transcripts.getCommitted(), activeLang.code);
             metrics.addUtterance();
@@ -323,9 +370,10 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         // --- Bootstrap phase (Option A): provisional speculative decode keeps
         // partials flowing after ~160 ms while bootstrap acoustic LID decides
         // the language in parallel. Provisional text is SPECULATIVE-only and
-        // is adopted (same language, no replay) or discarded (other language)
-        // on commit — never committed itself (§11).
+        // is adopted (same language on a complete stream, no replay) or
+        // discarded (other language) on commit — never committed itself (§11).
         if (activeLang == AsrLanguage.UND) {
+            applyPendingProvisionalSwitch();
             tryBootstrapLid(nowMs);
             accumulateScheduler(frame, nowMs, true);
             return;
@@ -333,6 +381,16 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
 
         // 160 ms scheduler accumulation on the active stream.
         accumulateScheduler(frame, nowMs, false);
+
+        // Referee mode (§6.1): after a WEAK bootstrap commit the acoustic LID
+        // keeps re-evaluating the utterance (tryBootstrapLid owns the cadence
+        // and the per-utterance attempt cap) instead of going silent. A
+        // confident disagreement is handed to the runtime hysteresis/rollback
+        // gate (see refereeOnActive) — never a hard switch. Solid commits skip
+        // this, so ECAPA costs nothing then.
+        if (bootstrapCommitConfidence < AsrState.BOOTSTRAP_THRESHOLD) {
+            tryBootstrapLid(nowMs);
+        }
 
         // Async ECAPA referee (§22), never blocking ASR: stable 600 ms,
         // uncertain 400 ms, observed candidate 250 ms. ASR still ticks every
@@ -400,33 +458,46 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     }
 
     /**
-     * Provisional speculative decode (Option A): continuous partials on the
-     * VI engine while UNKNOWN. The decode MUST keep running (the adopt
-     * fast-path needs the live stream state), but UI posts are hidden
-     * speculative-only (lang=UND, never committed) and de-duplicated:
-     * re-posting the identical hypothesis every 160 ms only flickers the UI.
+     * Provisional speculative decode (Option A): continuous partials while
+     * UNKNOWN. The decode MUST keep running (the adopt fast-path needs the
+     * live stream state), but UI posts are speculative-only (lang=UND, never
+     * committed), de-duplicated, and gated by {@link #provisionalQuiet}:
+     * foreign-leaning evidence hides VI-guess text instead of rendering it.
      * Text is held outside the shared transcript manager so a later commit
      * to another language discards it without a trace.
+     *
+     * 2026-09-16 §6.2: the stream starts on the always-resident VI engine
+     * but uncertain LID evidence steers it (see
+     * {@link #applyProvisionalPolicy}) — never a hard-coded VI lock.
+     * All engine calls are serialized on {@link #engineLock} (GetFrames race).
      */
     private void decodeProvisional(float[] chunk, long audioTimeMs) {
         if (provisionalAsr == null) {
             try {
                 provisionalAsr = models.get(AsrLanguage.VI);
-                provisionalAsr.reset();
+                synchronized (engineLock) {
+                    provisionalAsr.reset();
+                }
+                provisionalLang = AsrLanguage.VI;
+                provisionalComplete = true;
             } catch (Exception e) {
                 Log.w(TAG, "provisional engine unavailable", e);
                 return;
             }
         }
+        final StreamingAsrEngine eng = provisionalAsr;
+        final StreamingAsrEngine.PartialResult p;
         long t0 = System.currentTimeMillis();
         metrics.mark(AsrMetrics.ASR_START, t0);
-        provisionalAsr.acceptAudio(chunk);
-        // Readiness gate applies here too (sherpa aborts on under-buffered
-        // decode — fatal, not an exception).
-        if (provisionalAsr.isReadyToDecode()) {
-            provisionalAsr.decodeAvailable();
+        synchronized (engineLock) {
+            eng.acceptAudio(chunk);
+            // Readiness gate applies here too (sherpa aborts on under-buffered
+            // decode — fatal, not an exception).
+            if (eng.isReadyToDecode()) {
+                eng.decodeAvailable();
+            }
+            p = eng.getPartialResult();
         }
-        StreamingAsrEngine.PartialResult p = provisionalAsr.getPartialResult();
         metrics.mark(AsrMetrics.ASR_END);
         metrics.mark(AsrMetrics.PARTIAL_VISIBLE);
         metrics.addPartialLatency(System.currentTimeMillis() - audioTimeMs);
@@ -437,7 +508,10 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         dbgLastConf = p.confidence;
         provisionalSpeculative = dbgLastPartial;
         provisionalConf = p.confidence;
-        if (!dbgLastPartial.isEmpty() && !dbgLastPartial.equals(lastPostedProvisional)) {
+        // The decode keeps running even while quiet (adopt needs the live
+        // stream); only the UI post is gated.
+        if (!dbgLastPartial.isEmpty() && !dbgLastPartial.equals(lastPostedProvisional)
+                && !provisionalQuiet) {
             lastPostedProvisional = dbgLastPartial;
             Log.d(TAG, "provisional lang=" + provisionalLang.code + " conf=" + p.confidence
                     + " text=" + truncate(dbgLastPartial, 80));
@@ -446,18 +520,102 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         if (dbgFrames % 100 == 0) logDbg();
     }
 
+    /**
+     * Steer the hidden provisional decoder from uncertain LID evidence
+     * (LID worker thread; 2026-09-16 §6.2, mirrors the Python reference).
+     *
+     * When the fused evidence persistently (2 agreeing hops) leans to another
+     * language strongly enough, the provisional stream follows it — so the
+     * adopt fast-path works for EN/ZH too and live partials decode in the
+     * right language. When that engine is not resident the UI stays quiet
+     * instead of showing VI-decoded garbage for foreign audio (the field-log
+     * symptom: English rendered as Vietnamese text). Weak evidence keeps the
+     * current provisional audible (avoids silence on noisy starts). Never
+     * lazy-loads: the audio thread resolves the handoff.
+     */
+    private void applyProvisionalPolicy(LanguageIdEngine.LidResult r) {
+        if (r == null || r.scores == null || r.scores.isEmpty()) return;
+        AsrLanguage top = null;
+        float topScore = -1f;
+        for (AsrLanguage l : new AsrLanguage[]{AsrLanguage.VI, AsrLanguage.EN, AsrLanguage.ZH}) {
+            Float v = r.scores.get(l);
+            float f = v == null ? 0f : v;
+            if (f > topScore) {
+                topScore = f;
+                top = l;
+            }
+        }
+        if (top == null) return;
+        boolean persistent = (top == lastUncertainTop);
+        lastUncertainTop = top;
+        if (top == provisionalLang) {
+            provisionalQuiet = false;
+            return;
+        }
+        if (topScore < AsrState.PROVISIONAL_MIN_SUPPORTED_REL || !persistent) {
+            return;
+        }
+        if (models.isResident(top)) {
+            pendingProvisionalLang = top;
+            provisionalQuiet = false;
+        } else {
+            provisionalQuiet = true;
+        }
+    }
+
+    /**
+     * Apply a worker-requested provisional engine switch (audio thread).
+     * The new stream starts empty: {@link #provisionalComplete} is cleared so
+     * a later commit to this language replays instead of adopting a headless
+     * stream. Pointer swap is under the pipeline monitor (mutually exclusive
+     * with the worker-side adopt); engine calls stay on {@link #engineLock}.
+     */
+    private void applyPendingProvisionalSwitch() {
+        AsrLanguage pending = pendingProvisionalLang;
+        if (pending == null || pending == provisionalLang
+                || activeLang != AsrLanguage.UND) {
+            return;
+        }
+        pendingProvisionalLang = null;
+        synchronized (this) {
+            if (pending == provisionalLang || activeLang != AsrLanguage.UND) return;
+            try {
+                StreamingAsrEngine eng = models.get(pending);
+                synchronized (engineLock) {
+                    eng.reset();
+                }
+                provisionalAsr = eng;
+                provisionalLang = pending;
+                provisionalSpeculative = "";
+                provisionalConf = 0.33f;
+                lastPostedProvisional = "";
+                provisionalQuiet = false;
+                provisionalComplete = false;
+                Log.i(TAG, "provisional decoder follows evidence: " + pending.code);
+            } catch (Exception e) {
+                Log.w(TAG, "provisional switch failed for " + pending, e);
+            }
+        }
+    }
+
     private void decodeChunk(float[] chunk, long audioTimeMs) {
         if (activeAsr == null) return;
+        final StreamingAsrEngine eng = activeAsr;
+        final StreamingAsrEngine.PartialResult p;
         long t0 = System.currentTimeMillis();
         metrics.mark(AsrMetrics.ASR_START, t0);
-        activeAsr.acceptAudio(chunk);
-        // NEVER decode without the readiness gate: sherpa aborts the whole
-        // process on an under-buffered decode (GetFrames OOB is fatal, not
-        // an exception). See flushScheduler.
-        if (activeAsr.isReadyToDecode()) {
-            activeAsr.decodeAvailable();
+        // Serialized on engineLock: the LID worker may shadow-decode a
+        // candidate (or replay the bootstrap winner) concurrently.
+        synchronized (engineLock) {
+            eng.acceptAudio(chunk);
+            // NEVER decode without the readiness gate: sherpa aborts the whole
+            // process on an under-buffered decode (GetFrames OOB is fatal, not
+            // an exception). See flushScheduler.
+            if (eng.isReadyToDecode()) {
+                eng.decodeAvailable();
+            }
+            p = eng.getPartialResult();
         }
-        StreamingAsrEngine.PartialResult p = activeAsr.getPartialResult();
         metrics.mark(AsrMetrics.ASR_END);
         transcripts.updateSpeculative(p.text);
         metrics.mark(AsrMetrics.PARTIAL_VISIBLE);
@@ -476,24 +634,63 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     // --- Bootstrap acoustic LID (§7–§9, §14, §24, §27) --------------------
 
     /**
-     * Submit one async bootstrap classify when enough speech audio has
-     * accumulated. Runs on the audio thread; the classify itself runs on
-     * lidExecutor, never in the audio callback (§26).
+     * Submit one async bootstrap/referee classify. Runs on the audio thread;
+     * the classify itself runs on lidExecutor, never in the audio callback
+     * (§26). Mirrors the Python reference.
+     *
+     * Bootstrap phase (no language yet): hop-gated submits with a GROWING
+     * window (baseline → MAX), capped per utterance (CPU bound). Referee
+     * phase (§6.1, weak commit only): speech-gated re-evaluation so a weak
+     * early decision can still be corrected via the runtime gate. All pacing
+     * checks run BEFORE the single-flight flag is set, so the flag can never
+     * get stuck by an early return.
      */
     private void tryBootstrapLid(long nowMs) {
-        if (activeLang != AsrLanguage.UND || bootstrapPending) return;
-        if (utteranceSpeechMs < AsrState.BOOTSTRAP_MIN_MS) return;
-        // Rolling hop gate (§5, §16): one attempt per 200 ms of fresh audio
-        // (600 ms window / 200 ms hop → temporal smoother fuses 3 hops).
-        // Past BOOTSTRAP_MAX_MS keep polling at the hop cadence — the
-        // uncertain path below rate-limits the expensive dual-candidate pass.
-        if (lastBootstrapSpeechMs >= 0
-                && utteranceSpeechMs - lastBootstrapSpeechMs < AsrState.BOOTSTRAP_HOP_MS) {
-            return;
+        if (bootstrapPending) return;
+        final boolean bootstrapping = activeLang == AsrLanguage.UND;
+        if (bootstrapping) {
+            if (utteranceSpeechMs < AsrState.BOOTSTRAP_MIN_MS) return;
+            // Rolling hop gate (§5, §16): one attempt per 200 ms of fresh audio
+            // (window / hop → temporal smoother fuses 3 hops).
+            if (lastBootstrapSpeechMs >= 0
+                    && utteranceSpeechMs - lastBootstrapSpeechMs < AsrState.BOOTSTRAP_HOP_MS) {
+                return;
+            }
+            if (refereeAttempts >= AsrState.REFEREE_MAX_ATTEMPTS) {
+                // Budget spent without a commit: no more ECAPA — keep
+                // retrying candidates on the last ranking (cooldown-gated,
+                // worker thread; mirrors the Python reference).
+                retryCandidatesFromLast();
+                return;
+            }
+            lastBootstrapSpeechMs = utteranceSpeechMs;
+        } else {
+            // Referee pass (§6.1): only after a WEAK commit (the caller
+            // checks bootstrapCommitConfidence), paced by speech and bounded
+            // per utterance. nowMs is unused here; cadence is speech-gated so
+            // paused speech burns no ECAPA.
+            if (bootstrapCommitConfidence >= AsrState.BOOTSTRAP_THRESHOLD) return;
+            if (refereeAttempts >= AsrState.REFEREE_MAX_ATTEMPTS) return;
+            if (utteranceSpeechMs - lastRefereeSpeechMs
+                    < AsrState.SPECULATIVE_CANDIDATE_COOLDOWN_MS) {
+                return;
+            }
+            lastRefereeSpeechMs = utteranceSpeechMs;
         }
         bootstrapPending = true;
-        lastBootstrapSpeechMs = utteranceSpeechMs;
-        final float[] window = ring.lastMs(AsrState.BOOTSTRAP_LID_WINDOW_MS);
+        refereeAttempts++;
+        // Dynamic window: grow with the utterance up to BOOTSTRAP_MAX_MS. The
+        // fixed 600 ms window never showed ECAPA enough context for reliable
+        // evidence (see docs/voxlingua_lid_diagnosis.md).
+        final int windowMs = Math.min(AsrState.BOOTSTRAP_MAX_MS,
+                Math.max(AsrState.BOOTSTRAP_LID_WINDOW_MS, (int) utteranceSpeechMs));
+        // Onset-anchored (2026-09-16 v2): lastMs dilutes a growing window
+        // with trailing/pre-speech silence — score the utterance audio
+        // itself, oldest-first, like the commit replay does. The referee
+        // below keeps lastMs (it judges CURRENT audio, not the onset).
+        final float[] window = bootstrapping
+                ? utteranceAudio(windowMs)
+                : ring.lastMs(windowMs);
         final long uid = utteranceSeq.get();
         final long speechMs = utteranceSpeechMs;
         metrics.mark(AsrMetrics.LID_START);
@@ -504,7 +701,7 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
                 r = lid.classifyBootstrap(window);
                 metrics.mark(AsrMetrics.LID_END);
                 metrics.addRtf((System.currentTimeMillis() - t0)
-                        / (double) AsrState.BOOTSTRAP_LID_WINDOW_MS);
+                        / (double) windowMs);
             } catch (Exception e) {
                 Log.w(TAG, "bootstrap classify failed", e);
                 bootstrapPending = false;
@@ -524,18 +721,32 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
                                       long speechMsAtRequest) {
         try {
             if (uid != utteranceSeq.get()) return; // stale: utterance ended
+            final boolean alreadyActive;
             synchronized (this) {
-                if (activeLang != AsrLanguage.UND) return; // won race (§27)
+                alreadyActive = activeLang != AsrLanguage.UND;
+            }
+            if (alreadyActive) {
+                // §6.1 Referee Mode: a language is already active, so this is a
+                // referee verdict, not a bootstrap one. Never a hard switch —
+                // hand it to the runtime hysteresis/rollback gate (the same
+                // path the 480 ms runtime LID uses). Deliberately OUTSIDE the
+                // monitor: that gate can run a shadow decode.
+                refereeOnActive(r, uid);
+                return;
             }
             AsrLanguage decided = router.onBootstrapLidResult(r);
             if (decided != AsrLanguage.UND) {
                 activateBootstrap(decided, r.confidence, uid);
                 return;
             }
-            // Uncertain: one extension (§9 cách 1), then dual-candidate (§32).
+            // Uncertain: steer the provisional stream from this evidence, then
+            // either extend (§9 cách 1) or run dual-candidates (§32).
+            lastBootstrapResult = r;
+            applyProvisionalPolicy(r);
             boolean mayExtend;
             synchronized (this) {
                 mayExtend = utteranceSpeechMs < AsrState.BOOTSTRAP_MAX_MS
+                        && refereeAttempts < AsrState.REFEREE_MAX_ATTEMPTS
                         && uid == utteranceSeq.get()
                         && activeLang == AsrLanguage.UND;
             }
@@ -579,13 +790,19 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     /**
      * Activate the bootstrap winner (§13, §15, §25) — adopt or rollback:
      * <ul>
-     *   <li>Winner == provisional language → <b>adopt</b> the provisional
-     *   stream as-is: no reset, no replay, zero duplication (the scheduler
-     *   residue in schedulerBuf continues into the same engine).</li>
-     *   <li>Winner differs → <b>rollback</b>: discard the provisional text
-     *   without a trace, reset the winner and REPLAY the buffered utterance
-     *   audio into it, so the first 200–300 ms are decoded — not dropped.</li>
+     *   <li>Winner == provisional language on a COMPLETE stream → <b>adopt</b>
+     *   the live stream as-is: no reset, no replay, zero duplication (the
+     *   scheduler residue in schedulerBuf continues into the same
+     *   engine).</li>
+     *   <li>Otherwise → <b>rollback</b>: discard the provisional text without
+     *   a trace, reset the winner and REPLAY the buffered utterance audio
+     *   into it, so the first words are decoded — not dropped. In particular
+     *   a mid-utterance provisional engine switch leaves a headless stream,
+     *   which must never be adopted.</li>
      * </ul>
+     * Engine calls run on {@link #engineLock} (GetFrames race); the method
+     * itself stays under the pipeline monitor so the audio-thread switch
+     * ({@link #applyPendingProvisionalSwitch}) cannot interleave.
      */
     private synchronized void activateBootstrap(AsrLanguage lang, float confidence,
                                                 long uid) {
@@ -601,11 +818,13 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
             bootstrapPending = false;
             return;
         }
-        if (lang == provisionalLang && provisionalAsr != null) {
+        if (lang == provisionalLang && provisionalAsr != null && provisionalComplete) {
             // Adopt: the live stream already holds the full utterance state.
             activeAsr = provisionalAsr;
             provisionalAsr = null;
             activeLang = lang;
+            bootstrapCommitConfidence = confidence;
+            refereeAttempts = 0; // fresh referee budget for a weak commit
             router.commitBootstrap(lang, confidence);
             // Seed the transcript lifecycle with the speculative text shown
             // so far (it firms up via STABLE like any other partial).
@@ -615,14 +834,17 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
             Log.i(TAG, "bootstrap adopted provisional " + lang.code + " conf=" + confidence);
             provisionalSpeculative = "";
             lastPostedProvisional = "";
+            provisionalQuiet = false;
             bootstrapPending = false;
             return;
         }
-        // Rollback: provisional text belonged to the wrong language — drop it
-        // (it never entered the transcript manager) and rebuild on the winner.
+        // Rollback: provisional text belonged to the wrong language (or a
+        // headless switched stream) — drop it (it never entered the
+        // transcript manager) and rebuild on the winner.
         provisionalSpeculative = "";
         lastPostedProvisional = "";
         provisionalAsr = null;
+        provisionalQuiet = false;
         schedulerFill = 0; // replay below re-covers this audio from the ring
         setActiveLanguage(lang, confidence);
         float[] buffered;
@@ -633,15 +855,19 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
             buffered = new float[0];
         }
         if (buffered.length > 0 && activeAsr != null) {
-            int step = schedulerTarget;
-            for (int off = 0; off < buffered.length; off += step) {
-                int n = Math.min(step, buffered.length - off);
-                float[] slice = new float[n];
-                System.arraycopy(buffered, off, slice, 0, n);
-                activeAsr.acceptAudio(slice);
-                if (activeAsr.isReadyToDecode()) activeAsr.decodeAvailable();
+            final StreamingAsrEngine target = activeAsr;
+            final int step = schedulerTarget;
+            final StreamingAsrEngine.PartialResult p;
+            synchronized (engineLock) {
+                for (int off = 0; off < buffered.length; off += step) {
+                    int n = Math.min(step, buffered.length - off);
+                    float[] slice = new float[n];
+                    System.arraycopy(buffered, off, slice, 0, n);
+                    target.acceptAudio(slice);
+                    if (target.isReadyToDecode()) target.decodeAvailable();
+                }
+                p = target.getPartialResult();
             }
-            StreamingAsrEngine.PartialResult p = activeAsr.getPartialResult();
             // Still SPECULATIVE (§11): bootstrap chose the language, but the
             // transcript firms up only with more audio.
             transcripts.updateSpeculative(p.text);
@@ -655,6 +881,30 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     }
 
     /**
+     * Candidate retry after the ECAPA budget is spent (audio thread): reuses
+     * the last bootstrap ranking on the cooldown cadence instead of burning
+     * more ECAPA. The slot is claimed pre-submit so the 20 ms audio callback
+     * cannot flood the single-thread worker; the task itself rechecks
+     * utterance/staleness before decoding. Mirrors the Python reference
+     * (which retries candidates every cooldown until give-up).
+     */
+    private void retryCandidatesFromLast() {
+        if (activeLang != AsrLanguage.UND) return;
+        final LanguageIdEngine.LidResult r = lastBootstrapResult;
+        if (r == null) return;
+        final long speechMs = utteranceSpeechMs;
+        if (speechMs > AsrState.BOOTSTRAP_GIVE_UP_MS) return;
+        if (lastCandidateRunSpeechMs >= 0
+                && speechMs - lastCandidateRunSpeechMs
+                < AsrState.SPECULATIVE_CANDIDATE_COOLDOWN_MS) {
+            return;
+        }
+        lastCandidateRunSpeechMs = speechMs;
+        final long uid = utteranceSeq.get();
+        lidExecutor.submit(() -> runSpeculativeCandidates(r, uid));
+    }
+
+    /**
      * Uncertain-bootstrap fallback (§32): decode a short window on at most
      * the top-2 candidate models (1–2 chunks each, one-shot — never 3 models
      * continuously, §10) and commit the winner by confidence + lexical fit.
@@ -665,7 +915,8 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     private void runSpeculativeCandidates(LanguageIdEngine.LidResult r, long uid) {
         float[] window;
         try {
-            window = ring.lastMs(AsrState.BOOTSTRAP_MAX_MS);
+            // Onset-anchored like the bootstrap window (no silence dilution).
+            window = utteranceAudio(AsrState.BOOTSTRAP_MAX_MS);
         } catch (Exception e) {
             Log.w(TAG, "speculative candidates: no audio", e);
             return;
@@ -687,6 +938,7 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
      */
     private AsrLanguage[] chooseCandidatePair(Map<AsrLanguage, Float> scores) {
         AsrLanguage[] top = topTwo(scores);
+        if (top[0] == null) return top; // defensive: topTwo never returns nulls
         AsrLanguage[] last = lastCandidatePair;
         if (last == null) return top;
         AsrLanguage leftover = null;
@@ -729,6 +981,7 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
             lastCandidatePair = pair;
             AsrLanguage winner = null;
             float winnerScore = -1;
+            float secondScore = -1;
             String winnerText = "";
             float winnerConf = 0;
             for (AsrLanguage cand : pair) {
@@ -737,15 +990,27 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
                 if (s == null) continue;
                 float combined = 0.65f * s.confidence
                         + 0.35f * LanguageIdEngine.lexicalFit(s.text, cand);
-                if (!s.text.isEmpty() && combined > winnerScore) {
+                if (s.text.isEmpty()) continue;
+                if (combined > winnerScore) {
+                    secondScore = winnerScore;
                     winnerScore = combined;
                     winner = cand;
                     winnerText = s.text;
                     winnerConf = s.confidence;
+                } else if (combined > secondScore) {
+                    secondScore = combined;
                 }
             }
-            // Minimum bar: a lone weak decode must not force a language.
-            if (winner != null && !winnerText.isEmpty() && winnerScore >= 0.30f) {
+            // Unified bar (§6.3, mirrors the Python reference): the candidate
+            // path used to commit at 0.30, far below the 0.70 acoustic gate —
+            // a rejected LID therefore always produced a low-confidence
+            // commit, and the [VI, EN] tie-break made it Vietnamese. Now the
+            // winner needs acoustic-commit-level evidence plus a margin over
+            // the runner-up (no coin-flip commits); confidence stays capped
+            // below 0.70 so the referee can still correct a fallback commit.
+            if (winner != null && !winnerText.isEmpty()
+                    && winnerScore >= AsrState.CANDIDATE_COMMIT_SCORE
+                    && (winnerScore - secondScore) >= AsrState.CANDIDATE_MARGIN) {
                 Log.i(TAG, "speculative candidates picked " + winner.code
                         + " score=" + winnerScore);
                 activateBootstrap(winner, Math.min(0.69f, winnerScore), uid);
@@ -757,25 +1022,35 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         }
     }
 
-    /** Top-2 languages from a bootstrap score map (UND excluded). */
+    /** Top-2 languages from a bootstrap score map (UND excluded).
+     *
+     * 2026-09-16 §6.3: pure score order with a fixed scan order that does NOT
+     * lead with VI ([EN, ZH, VI]) — the old [VI, EN, ZH] scan returned
+     * [VI, EN] on every flat/uncertain map, and with the 0.30 bar the
+     * fallback commit was almost always Vietnamese. Rotation
+     * ({@link #chooseCandidatePair}) still covers the third language on the
+     * next pass. Mirrors the Python reference exactly (stable sort over
+     * [en, zh, vi]).
+     */
     private static AsrLanguage[] topTwo(Map<AsrLanguage, Float> scores) {
-        AsrLanguage first = AsrLanguage.VI;
-        AsrLanguage second = AsrLanguage.EN;
-        float s1 = -1;
-        float s2 = -1;
-        if (scores != null) {
-            for (AsrLanguage l : new AsrLanguage[]{AsrLanguage.VI, AsrLanguage.EN, AsrLanguage.ZH}) {
-                Float v = scores.get(l);
-                float f = v == null ? 0 : v;
-                if (f > s1) {
-                    s2 = s1;
-                    second = first;
-                    s1 = f;
-                    first = l;
-                } else if (f > s2) {
-                    s2 = f;
-                    second = l;
-                }
+        // No ranking at all (null map): same non-VI-first default as a flat
+        // map below — never a VI-first guess.
+        if (scores == null) return new AsrLanguage[]{AsrLanguage.EN, AsrLanguage.ZH};
+        AsrLanguage first = null;
+        AsrLanguage second = null;
+        float s1 = Float.NEGATIVE_INFINITY;
+        float s2 = Float.NEGATIVE_INFINITY;
+        for (AsrLanguage l : new AsrLanguage[]{AsrLanguage.EN, AsrLanguage.ZH, AsrLanguage.VI}) {
+            Float v = scores.get(l);
+            float f = v == null ? 0f : v;
+            if (f > s1) {
+                s2 = s1;
+                second = first;
+                s1 = f;
+                first = l;
+            } else if (f > s2) {
+                s2 = f;
+                second = l;
             }
         }
         return new AsrLanguage[]{first, second};
@@ -790,23 +1065,28 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
      * One-shot decode of the bootstrap window on a candidate (never the
      * active stream). The provisional engine is read WITHOUT reset — wiping
      * it would destroy the live speculative stream it is still decoding.
+     * Serialized on {@link #engineLock} (GetFrames race: the audio thread may
+     * be decoding the provisional engine concurrently).
      */
     private CandidateScore scoreSpeculativeCandidate(AsrLanguage cand, float[] window) {
         try {
             StreamingAsrEngine e = models.get(cand);
             boolean isLiveProvisional = (e == provisionalAsr);
-            if (!isLiveProvisional) {
-                e.reset();
-                int step = AsrState.SCHEDULER_SAMPLES;
-                for (int off = 0; off < window.length; off += step) {
-                    int n = Math.min(step, window.length - off);
-                    float[] slice = new float[n];
-                    System.arraycopy(window, off, slice, 0, n);
-                    e.acceptAudio(slice);
-                    if (e.isReadyToDecode()) e.decodeAvailable();
+            final StreamingAsrEngine.PartialResult p;
+            synchronized (engineLock) {
+                if (!isLiveProvisional) {
+                    e.reset();
+                    int step = AsrState.SCHEDULER_SAMPLES;
+                    for (int off = 0; off < window.length; off += step) {
+                        int n = Math.min(step, window.length - off);
+                        float[] slice = new float[n];
+                        System.arraycopy(window, off, slice, 0, n);
+                        e.acceptAudio(slice);
+                        if (e.isReadyToDecode()) e.decodeAvailable();
+                    }
                 }
+                p = e.getPartialResult();
             }
-            StreamingAsrEngine.PartialResult p = e.getPartialResult();
             CandidateScore s = new CandidateScore();
             s.text = p.text == null ? "" : p.text.trim();
             s.confidence = p.confidence;
@@ -815,6 +1095,31 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
             Log.w(TAG, "speculative decode failed for " + cand, ex);
             return null;
         }
+    }
+
+    /**
+     * §6.1 Referee Mode verdict while a language is already active. The
+     * acoustic referee never switches anything by itself: an agreement just
+     * firms up the current decision (and then stops the referee), a
+     * disagreement is forwarded to the runtime gate (threshold + margin +
+     * persistence + shadow verification), which is what keeps a single noisy
+     * long window from rewriting committed text.
+     */
+    private void refereeOnActive(LanguageIdEngine.LidResult r, long uid) {
+        if (r == null || r.language == null) return;
+        final AsrLanguage active = activeLang;
+        if (r.language == AsrLanguage.UND || r.language == active) {
+            if (r.confidence >= AsrState.BOOTSTRAP_THRESHOLD) {
+                bootstrapCommitConfidence = r.confidence;
+                Log.i(TAG, "referee confirms " + active.code + " conf=" + r.confidence);
+            } else {
+                Log.d(TAG, "referee agrees weakly, staying " + active.code);
+            }
+            return;
+        }
+        Log.i(TAG, "referee disagrees: " + r.language.code + " conf=" + r.confidence
+                + " vs active " + active.code + " → runtime gate");
+        onLidResult(r, uid);
     }
 
     private void onLidResult(LanguageIdEngine.LidResult r, long uid) {
@@ -837,23 +1142,30 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         }
     }
 
-    /** Shadow decode of the rollback window on the candidate model. */
+    /**
+     * Shadow decode of the rollback window on the candidate model.
+     * Serialized on {@link #engineLock}: the audio thread keeps decoding the
+     * active stream while this runs (GetFrames race).
+     */
     private LanguageRouter.Verification verifyCandidate(AsrLanguage candidate,
                                                         float[] rollbackAudio) {
         try {
             StreamingAsrEngine cand = models.get(candidate);
             // Fresh stream state for the window (never the active stream),
             // paced like live input.
-            cand.reset();
-            int step = AsrState.SCHEDULER_SAMPLES;
-            for (int off = 0; off < rollbackAudio.length; off += step) {
-                int n = Math.min(step, rollbackAudio.length - off);
-                float[] slice = new float[n];
-                System.arraycopy(rollbackAudio, off, slice, 0, n);
-                cand.acceptAudio(slice);
-                if (cand.isReadyToDecode()) cand.decodeAvailable();
+            final StreamingAsrEngine.PartialResult r;
+            synchronized (engineLock) {
+                cand.reset();
+                int step = AsrState.SCHEDULER_SAMPLES;
+                for (int off = 0; off < rollbackAudio.length; off += step) {
+                    int n = Math.min(step, rollbackAudio.length - off);
+                    float[] slice = new float[n];
+                    System.arraycopy(rollbackAudio, off, slice, 0, n);
+                    cand.acceptAudio(slice);
+                    if (cand.isReadyToDecode()) cand.decodeAvailable();
+                }
+                r = cand.getPartialResult();
             }
-            StreamingAsrEngine.PartialResult r = cand.getPartialResult();
             String tokens = r.text == null ? "" : r.text.trim();
             // Heuristic gate: accept when the candidate actually decoded
             // content with reasonable confidence. A real deployment compares
@@ -902,33 +1214,42 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
             schedulerFill = 0;
             return null;
         }
-        if (schedulerFill > 0) {
-            float[] tail = new float[schedulerFill];
-            System.arraycopy(schedulerBuf, 0, tail, 0, schedulerFill);
-            engine.acceptAudio(tail);
+        // All engine calls serialized on engineLock (GetFrames race: the audio
+        // thread may be decoding another engine concurrently).
+        synchronized (engineLock) {
+            if (schedulerFill > 0) {
+                float[] tail = new float[schedulerFill];
+                System.arraycopy(schedulerBuf, 0, tail, 0, schedulerFill);
+                engine.acceptAudio(tail);
+            }
+            schedulerFill = 0;
+            int padded = 0;
+            int cap = 960 * AsrState.SAMPLE_RATE / 1000;
+            while (!engine.isReadyToDecode() && padded < cap) {
+                engine.acceptAudio(new float[AsrState.SCHEDULER_SAMPLES]);
+                padded += AsrState.SCHEDULER_SAMPLES;
+            }
+            if (!engine.isReadyToDecode()) return null;
+            engine.decodeAvailable();
+            return engine.getPartialResult();
         }
-        schedulerFill = 0;
-        int padded = 0;
-        int cap = 960 * AsrState.SAMPLE_RATE / 1000;
-        while (!engine.isReadyToDecode() && padded < cap) {
-            engine.acceptAudio(new float[AsrState.SCHEDULER_SAMPLES]);
-            padded += AsrState.SCHEDULER_SAMPLES;
-        }
-        if (!engine.isReadyToDecode()) return null;
-        engine.decodeAvailable();
-        return engine.getPartialResult();
     }
 
     private void onCommitted(AsrLanguage next, float[] window) {
         AsrLanguage prev = activeLang;
         transcripts.rollbackSpeculative();
         StreamingAsrEngine cand = models.get(next);
-        StreamingAsrEngine.PartialResult r = cand.getPartialResult();
+        final StreamingAsrEngine.PartialResult r;
+        synchronized (engineLock) {
+            r = cand.getPartialResult();
+        }
         transcripts.commit(r.text);
         setActiveLanguage(next, r.confidence);
         // Re-feed the window into the new active stream so its incremental
         // state continues from the switch point (spec §14).
-        activeAsr.acceptAudio(window);
+        synchronized (engineLock) {
+            if (activeAsr != null) activeAsr.acceptAudio(window);
+        }
         postSwitch(prev.code, next.code);
         postPartial(transcripts.getCommitted(), transcripts.getSpeculative(), next.code);
     }
@@ -946,7 +1267,11 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         // Flush residue first so tail words join THIS utterance instead of
         // leaking into the next one (see flushScheduler).
         flushScheduler();
-        StreamingAsrEngine.PartialResult fin = activeAsr.getFinalResult();
+        final StreamingAsrEngine eng = activeAsr;
+        final StreamingAsrEngine.PartialResult fin;
+        synchronized (engineLock) {
+            fin = eng.getFinalResult();
+        }
         String baseText = mergeDisplay(fin.text);
         // Endpoint candidate verification (spec §13.1, kept as backstop in
         // fakedemo2 Phase 5): replay the utterance through the non-active
@@ -1019,11 +1344,13 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
             }
             // Read from the utterance start: at an endpoint lastMs would
             // return mostly the trailing silence (§35 short utterances).
+            // Bootstrap replays up to the ENDPOINT window (wider than the live
+            // cap — no realtime pressure here; mirrors the Python reference).
             float[] spoken = utteranceAudio(AsrState.ENDPOINT_VERIFY_MS);
             float[] window = spoken.length > AsrState.SAMPLE_RATE
-                    * AsrState.BOOTSTRAP_LID_WINDOW_MS / 1000
+                    * AsrState.BOOTSTRAP_ENDPOINT_WINDOW_MS / 1000
                     ? java.util.Arrays.copyOfRange(spoken, 0,
-                            AsrState.SAMPLE_RATE * AsrState.BOOTSTRAP_LID_WINDOW_MS / 1000)
+                            AsrState.SAMPLE_RATE * AsrState.BOOTSTRAP_ENDPOINT_WINDOW_MS / 1000)
                     : spoken;
             LanguageIdEngine.LidResult r = lid.classifyBootstrap(window);
             AsrLanguage decided = router.onBootstrapLidResult(r);
@@ -1035,14 +1362,18 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
                 // then the leftover language if still undecided.
                 AsrLanguage[] pair = chooseCandidatePair(
                         r == null ? null : r.scores);
-                runSpeculativeCandidatesOn(r, uid, spoken, pair);
-                decided = activeLang;
-                if (decided == AsrLanguage.UND) {
-                    AsrLanguage[] rest = leftoversOf(pair);
-                    if (rest.length > 0) {
-                        runSpeculativeCandidatesOn(r, uid, spoken,
-                                new AsrLanguage[]{rest[0], AsrLanguage.UND});
-                        decided = activeLang;
+                // Defensive null guard (topTwo never returns nulls — flat maps
+                // fall back to [EN, ZH] with VI covered by the leftover pass).
+                if (pair[0] != null) {
+                    runSpeculativeCandidatesOn(r, uid, spoken, pair);
+                    decided = activeLang;
+                    if (decided == AsrLanguage.UND) {
+                        AsrLanguage[] rest = leftoversOf(pair);
+                        if (rest.length > 0) {
+                            runSpeculativeCandidatesOn(r, uid, spoken,
+                                    new AsrLanguage[]{rest[0], AsrLanguage.UND});
+                            decided = activeLang;
+                        }
                     }
                 }
             }
@@ -1056,7 +1387,11 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
             }
             if (decided != AsrLanguage.UND && activeAsr != null) {
                 flushScheduler();
-                StreamingAsrEngine.PartialResult fin = activeAsr.getFinalResult();
+                final StreamingAsrEngine eng = activeAsr;
+                final StreamingAsrEngine.PartialResult fin;
+                synchronized (engineLock) {
+                    fin = eng.getFinalResult();
+                }
                 String text = mergeDisplay(fin.text);
                 transcripts.finalizeTranscript(text);
                 postFinal(transcripts.getCommitted(), activeLang.code);
@@ -1080,33 +1415,15 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         }
     }
 
-    /**
-     * Adopt the provisional stream as the committed active model (used when
-     * endpoint verification confirms the provisional hypothesis). No reset,
-     * no replay — the engine already holds the full utterance state.
-     */
-    private synchronized void adoptProvisional(float confidence, long uid) {
-        if (uid != utteranceSeq.get() || activeLang != AsrLanguage.UND
-                || provisionalAsr == null) {
-            return;
-        }
-        activeAsr = provisionalAsr;
-        provisionalAsr = null;
-        activeLang = provisionalLang;
-        router.commitBootstrap(activeLang, confidence);
-        transcripts.updateSpeculative(provisionalSpeculative);
-        provisionalSpeculative = "";
-        lastPostedProvisional = "";
-        Log.i(TAG, "endpoint adopted provisional " + activeLang.code
-                + " conf=" + confidence);
-    }
-
     /** Clear per-utterance state; next utterance bootstraps from UNKNOWN. */
     private void resetUtteranceState() {
         transcripts.reset();
         if (activeAsr != null) {
+            final StreamingAsrEngine eng = activeAsr;
             try {
-                activeAsr.reset();
+                synchronized (engineLock) {
+                    eng.reset();
+                }
             } catch (Exception e) {
                 Log.w(TAG, "engine reset failed", e);
             }
@@ -1125,6 +1442,10 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         utteranceStartSample = -1;
         utteranceSpeechMs = 0;
         lastBootstrapSpeechMs = -1;
+        bootstrapCommitConfidence = 0f;
+        refereeAttempts = 0;
+        lastRefereeSpeechMs = -1;
+        lastBootstrapResult = null;
         lastCandidateRunSpeechMs = -1;
         lastCandidatePair = null;
         bootstrapPending = false;
@@ -1133,18 +1454,26 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     }
 
     /**
-     * (Re)point the provisional decoder at the always-resident VI engine
-     * with fresh state. Safe to call when the same object is also the (now
-     * cleared) active engine — reset is idempotent.
+     * (Re)point the provisional decoder at the always-resident VI engine with
+     * fresh state (§6.2: the START point is VI, but uncertain LID evidence
+     * steers it from there — never a hard-coded VI lock). Safe to call when
+     * the same object is also the (now cleared) active engine — reset is
+     * idempotent. Mirrors the Python reference.
      */
     private void resetProvisional() {
         provisionalLang = AsrLanguage.VI;
         provisionalSpeculative = "";
         lastPostedProvisional = "";
         provisionalConf = 0.33f;
+        provisionalQuiet = false;
+        provisionalComplete = true;
+        pendingProvisionalLang = null;
+        lastUncertainTop = null;
         try {
             provisionalAsr = models.get(AsrLanguage.VI);
-            provisionalAsr.reset();
+            synchronized (engineLock) {
+                provisionalAsr.reset();
+            }
         } catch (Exception e) {
             Log.w(TAG, "provisional reset failed", e);
             provisionalAsr = null;
@@ -1245,19 +1574,22 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     private EndpointVerdict scoreCandidate(AsrLanguage lang, float[] audio) {
         try {
             StreamingAsrEngine cand = models.get(lang);
-            cand.reset();
-            int step = AsrState.SCHEDULER_SAMPLES;
-            for (int off = 0; off < audio.length; off += step) {
-                int n = Math.min(step, audio.length - off);
-                float[] slice = new float[n];
-                System.arraycopy(audio, off, slice, 0, n);
-                cand.acceptAudio(slice);
-                if (cand.isReadyToDecode()) cand.decodeAvailable();
+            final StreamingAsrEngine.PartialResult r;
+            synchronized (engineLock) {
+                cand.reset();
+                int step = AsrState.SCHEDULER_SAMPLES;
+                for (int off = 0; off < audio.length; off += step) {
+                    int n = Math.min(step, audio.length - off);
+                    float[] slice = new float[n];
+                    System.arraycopy(audio, off, slice, 0, n);
+                    cand.acceptAudio(slice);
+                    if (cand.isReadyToDecode()) cand.decodeAvailable();
+                }
+                for (int i = 0; i < 4 && cand.isReadyToDecode(); i++) {
+                    cand.decodeAvailable();
+                }
+                r = cand.getPartialResult();
             }
-            for (int i = 0; i < 4 && cand.isReadyToDecode(); i++) {
-                cand.decodeAvailable();
-            }
-            StreamingAsrEngine.PartialResult r = cand.getPartialResult();
             EndpointVerdict v = new EndpointVerdict();
             v.lang = lang;
             v.text = r.text == null ? "" : r.text.trim();
@@ -1292,6 +1624,12 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     }
 
     private void setActiveLanguage(AsrLanguage lang, float conf) {
+        // §6.1: remember how solid this decision was. The acoustic referee
+        // keeps re-evaluating the utterance until the decision reaches
+        // BOOTSTRAP_THRESHOLD (see onFrame / refereeOnActive), with a fresh
+        // per-commit attempt budget.
+        bootstrapCommitConfidence = conf;
+        refereeAttempts = 0;
         // §13: never models.get(UND) — UND means "no active model yet".
         if (lang == null || lang == AsrLanguage.UND) {
             activeLang = AsrLanguage.UND;
@@ -1302,7 +1640,10 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         activeLang = lang;
         activeAsr = models.get(lang);
         try {
-            activeAsr.reset();
+            final StreamingAsrEngine eng = activeAsr;
+            synchronized (engineLock) {
+                eng.reset();
+            }
         } catch (Exception e) {
             Log.w(TAG, "engine reset failed for " + lang, e);
         }

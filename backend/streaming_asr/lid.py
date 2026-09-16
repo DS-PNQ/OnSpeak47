@@ -5,7 +5,6 @@ from .config import (
     LID_INTERVAL_STABLE_MS, LID_INTERVAL_UNCERTAIN_MS, LID_INTERVAL_CANDIDATE_MS,
     BOOTSTRAP_W_ACOUSTIC, BOOTSTRAP_W_PRIOR,
     RUNTIME_W_ACOUSTIC, RUNTIME_W_TEXT, RUNTIME_W_CONFIDENCE, RUNTIME_W_HISTORY,
-    VOXLINGUA_MIN_GLOBAL_SCORE,
 )
 
 LANGS = ("vi", "en", "zh")
@@ -259,22 +258,25 @@ class LanguageIdEngine:
         if not audio:
             return LidResult("und", 0.0, {l: 1.0 / 3 for l in LANGS})
 
-        # Detailed VoxLingua path (§14): global-top policy first.
+        # Detailed VoxLingua path (§14–§15): two-tier gate (2026-09-16 v2).
+        # FAST (absolute mass) commits clean audio; SLOW (unanimous relative
+        # + foreign-guard) commits noisy device-mic audio whose 107-way mass
+        # stays flat (~0.01) while the relative ranking is correct. Either
+        # confident result commits — never the argmax label, never VI by
+        # default. Scores are the acoustic map itself (already normalized):
+        # blending them 0.90/0.10 toward the prior would compress the margin
+        # and make the router re-reject gated results sitting near the bar.
         if hasattr(self.acoustic_scorer, "classify_detailed"):
             try:
                 detailed = self.acoustic_scorer.classify_detailed(audio)
                 if detailed is not None and getattr(detailed, "num_windows", 0) > 0:
-                    if not detailed.is_supported_top():
+                    if not (detailed.is_bootstrap_confident()
+                            or detailed.is_slow_bootstrap_confident()):
                         return LidResult("und", 0.0, {l: 1.0 / 3 for l in LANGS})
-                    if detailed.global_top_score < VOXLINGUA_MIN_GLOBAL_SCORE:
-                        return LidResult("und", 0.0, {l: 1.0 / 3 for l in LANGS})
-                    fused = _normalize({
-                        "vi": BOOTSTRAP_W_ACOUSTIC * detailed.vi + BOOTSTRAP_W_PRIOR * (1.0 / 3),
-                        "en": BOOTSTRAP_W_ACOUSTIC * detailed.en + BOOTSTRAP_W_PRIOR * (1.0 / 3),
-                        "zh": BOOTSTRAP_W_ACOUSTIC * detailed.zh + BOOTSTRAP_W_PRIOR * (1.0 / 3),
-                    })
-                    best = max(LANGS, key=lambda l: fused[l])
-                    return LidResult(best, fused[best], dict(fused))
+                    acoustic = _normalize(detailed.to_map())
+                    best = detailed.top_supported()
+                    return LidResult(best, detailed.top_supported_score(),
+                                     dict(acoustic))
             except Exception:
                 pass
 

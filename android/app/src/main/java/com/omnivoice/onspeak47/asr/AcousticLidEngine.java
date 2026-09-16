@@ -47,6 +47,18 @@ public interface AcousticLidEngine {
         return null;
     }
 
+    /**
+     * Last SMOOTHED detailed result (temporal-smoother aggregate), or null
+     * when the engine has no smoothing state (legacy/heuristic scorers).
+     * Used by the pipeline to pick the provisional decoder language from
+     * acoustic evidence instead of a hard-coded VI (2026-09-16 fix §6.2);
+     * a null return simply means "no acoustic view" and the caller falls
+     * back to its fused EMA ranking.
+     */
+    default LanguageScores smoothed() {
+        return null;
+    }
+
     /** Clear per-utterance temporal smoothing state (no-op by default). */
     default void reset() {
     }

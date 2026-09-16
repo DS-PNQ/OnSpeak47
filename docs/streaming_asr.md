@@ -39,19 +39,38 @@ Streaming Zipformer is the production ASR path (Whisper removed in
 - Rollback 640 ms default (up to 960), candidate-only shadow decode, 1500 ms
   cooldown after a rejected candidate (avoids decode storms on stuck LID).
 - Every utterance starts UNKNOWN: bootstrap acoustic LID commits the first
-  model from 200–300 ms of audio (`0.90·acoustic + 0.10·prior`, gate `0.70` /
-  margin `0.15`), then the buffered audio is replayed into the winner — no
-  VI default, no transcript circularity. Uncertain → one window extension,
-  then a one-shot ≤2-model speculative decode (800 ms cooldown, rotating
-  pair so the 3rd language is tried next pass; endpoint also tries the
-  leftover).
+  model from audio alone via a two-tier gate (2026-09-16 v2) — FAST
+  (relative `0.70` / margin `0.15` + absolute supported mass `≥ 0.45`, clean
+  audio) or SLOW (same relative gate on the EMA + a full smoother depth of
+  UNANIMOUS raw windows + foreign-argmax guard at `0.60`). The old
+  "107-class argmax must be en/vi/zh" rule is gone: field logs showed device
+  audio keeps supported abs at ~0.01 with a correct relative ranking, so the
+  abs bar alone locked every utterance to UNKNOWN. Windows are
+  onset-anchored (no trailing-silence dilution) and GROW with the utterance
+  (1500 ms baseline → 1500 ms live cap, 200 ms hops, ≤6 submits per phase;
+  endpoints use a 2500 ms window), then the buffered audio is replayed into
+  the winner — no VI default, no transcript circularity. Uncertain → retries,
+  then a one-shot ≤2-model speculative decode (0.65 + 0.10 margin bar,
+  800 ms cooldown, rotating pair so the 3rd language is tried next pass;
+  endpoint also tries the leftover).
 - Option A provisional decode: while UNKNOWN the pipeline ALSO decodes
-  continuously on resident VI for live SPECULATIVE partials (~160 ms, never
-  committed). Same-language commit adopts the live stream (no replay);
-  other-language commit discards the provisional text and replays into the
-  winner. Endpoint while UNKNOWN flushes the provisional residue, then falls
-  back to pair + leftover + full-utterance verification with the provisional
-  hypothesis as base — utterances never get stuck with zero output.
+  continuously for live SPECULATIVE partials (~160 ms, never committed). It
+  starts on resident VI but uncertain LID evidence steers it: a persistent
+  lean to a resident engine moves the stream there (adopt works for EN/ZH
+  too), a lean to a non-resident engine quiets the UI instead of rendering
+  VI guesses. Same-language commit on a complete stream adopts it (no
+  replay); otherwise discard + replay into the winner. Endpoint while UNKNOWN
+  flushes the provisional residue, then falls back to pair + leftover with an
+  acoustic-confidence backstop — utterances never get stuck with zero output,
+  and weak evidence finalizes empty on UND instead of forcing VI.
+- Referee mode (§6.1): after a WEAK commit (< 0.70) the growing-window
+  acoustic LID keeps re-evaluating on an 800 ms speech cadence (fresh budget
+  per commit, ≤6 passes). Agreement firms the decision; disagreement goes
+  through the runtime hysteresis/rollback gate — never a hard switch.
+- Threading: every streaming-engine call is serialized on one lock
+  (`engineLock`); the audio thread and the LID worker share the resident
+  engines, and unsynchronized access used to abort the process in sherpa
+  `GetFrames` (fatal, uncatchable).
 - Endpoint switches use a lower bar (`0.60`, margin `0.10`): boundaries
   rewrite nothing and spend no rollback decode (spec §13.1).
 - Endpoint candidate verification: at each VAD endpoint (2000 ms silence,
@@ -72,38 +91,40 @@ Streaming Zipformer is the production ASR path (Whisper removed in
 
 ## Roadmap — acoustic LID / Option C (intra-utterance switching)
 
-Status: BOOTSTRAP LANDED (fakedemo2). Endpoint verification below is now the
-inter-utterance backstop; every utterance starts UNKNOWN and the first model
-is committed by audio-only bootstrap LID:
+Status: VOXLINGUA REFEREE LANDED (2026-09-16 fix; Java + Python mirror).
+`VoxLinguaAcousticLidEngine` (107-class ECAPA ONNX, `optimize/12_fetch_voxlingua_lid.py`)
+is the bootstrap + runtime referee; `HeuristicAcousticLidEngine` remains the
+no-asset fallback. Field-log root causes fixed
+(`docs/voxlingua_lid_diagnosis.md`):
 
-- `AcousticLidEngine` (+ interim `HeuristicAcousticLidEngine`: prosodic
-  time-domain cues, deliberately uncertain — capped below the 0.70 bar so it
-  can never force a language; swap for the trained tiny classifier without
-  touching callers).
-- `LanguageIdEngine.classifyBootstrap`: `0.90·acoustic + 0.10·prior`, no
-  text/history/ASR-confidence; no-scorer fallback is flat (never VI-locked).
-- `LanguageRouter`: starts `UND`/`UNKNOWN`, `onBootstrapLidResult` gate
-  (`top1 ≥ 0.70` AND `top1−top2 ≥ 0.15`), runtime `onLidResult` holds while
-  bootstrapping; hysteresis/rollback/shadow-verification unchanged.
-- `StreamingPipeline`: no ASR while `UND`, buffered-audio replay into the
-  winner, `utteranceSeq` stale-result guard, ≤2 speculative candidates with
-  800 ms cooldown, per-utterance reset to UNKNOWN.
-- Python mirror (`backend/streaming_asr/`) + 33 `test_07` tests + `bench`
-  A–D green.
+- Fixed 600 ms window → growing window (1500 ms baseline → 2500 ms cap).
+- Argmax-must-be-supported gate (+ max-sticky smoother) → absolute-mass gate
+  (`isBootstrapConfident`: relative `0.70/0.15` AND supported abs `≥ 0.45`);
+  global top now follows the latest window.
+- VI-biased fallback → evidence-steered provisional (switch-to-resident /
+  quiet), candidate bar `0.65 + 0.10` margin, non-VI-first tie-break,
+  post-weak-commit referee through the runtime gate.
+- Audio-thread / LID-worker engine sharing → serialized on one lock
+  (GetFrames abort fix).
+
+Mechanics (unchanged): `LanguageIdEngine.classifyBootstrap` is audio-only
+(`0.90·acoustic + 0.10·prior`, side-effect free); `LanguageRouter` starts
+`UND`/`UNKNOWN` with split bootstrap/runtime paths; `StreamingPipeline`
+replays buffered audio into the winner, guards stale results with
+`utteranceSeq`, runs ≤2 speculative candidates with 800 ms cooldown, and
+resets to UNKNOWN per utterance. Python mirror + `test_07` + `bench` A–D
+green (logic only — device numbers still required).
 
 Remaining device work:
 
-1. Research a small spoken-LID ONNX model covering vi/en/zh (target
-   ≤50 MB, CPU, ≤30 ms per 480 ms window).
-2. Bundle it via `optimize/11_fetch_streaming_zipformer.py` (+ labels).
-3. Wire it as `LanguageIdEngine.setAcousticScorer` / `setAcousticLidEngine`
-   (hook already exists; Python: the `acoustic_scorer` param) — no pipeline
-   changes needed.
-4. Retune fusion weights on the §26 set (see `RUNTIME_W_*` starting points
-   in `AsrState`/`config.py`) and confirm the 0.72 intra gate is reachable
-   with no VI lock-in and no mono-language P95 regression.
-5. Acceptance: intra-utterance VI→EN switch <1.5 s audio-time; ZH whole
-   utterances detected without CJK text evidence.
+1. Validate FBank/ONNX parity with the SpeechBrain reference, then measure
+   VI↔EN confusion on the §26 set (gates retune: abs bar, 1500/2500 windows).
+2. Benchmark ECAPA + Zipformer latency/RAM/thermal on the Snapdragon target;
+   confirm P50/P95 and the 0.72 intra gate with no VI lock-in.
+3. Decide INT8 for ECAPA only after the FP32 parity check passes.
+4. Acceptance: intra-utterance VI→EN switch <1.5 s audio-time; ZH whole
+   utterances detected without CJK text evidence; no stale-callback or
+   oscillation regressions in logcat.
 - Transcript tiers SPECULATIVE → STABLE (N=2 survival) → FINAL (spec §18).
 
 ## Tuning notes (found by `test_07` + `bench`, kept in code)

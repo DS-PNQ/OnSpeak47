@@ -53,7 +53,8 @@ public class VoxLinguaAcousticLidEngine implements AcousticLidEngine {
     private static final int MIN_SAMPLES = AsrState.SAMPLE_RATE * 400 / 1000;
 
     private final VoxLinguaFbankExtractor fbank = new VoxLinguaFbankExtractor();
-    private final VoxLinguaTemporalSmoother smoother = new VoxLinguaTemporalSmoother();
+    private final VoxLinguaTemporalSmoother smoother = new VoxLinguaTemporalSmoother(
+            VoxLinguaTemporalSmoother.DEFAULT_DEPTH, AsrState.LID_EMA_ALPHA);
     private final Object lock = new Object();
 
     private volatile OrtSession session;
@@ -124,7 +125,12 @@ public class VoxLinguaAcousticLidEngine implements AcousticLidEngine {
         }
     }
 
-    /** Last smoothed result (telemetry; never null). */
+    /**
+     * Last SMOOTHED detailed result (temporal-smoother aggregate; never null
+     * — flat before the first inference). Satisfies
+     * {@link AcousticLidEngine#smoothed()}.
+     */
+    @Override
     public LanguageScores smoothed() {
         synchronized (lock) {
             return smoother.smoothed();
@@ -293,12 +299,16 @@ public class VoxLinguaAcousticLidEngine implements AcousticLidEngine {
             en = vi = zh = 1.0f / 3;
         } else {
             // Supported-relative renormalization for the 0.70/0.15 gate;
-            // the absolute globalTopScore above still gates unsupported tops.
+            // the ABSOLUTE values below are carried alongside so the
+            // bootstrap gate can judge the real evidence level
+            // (2026-09-16 fix — see AsrState#VOXLINGUA_MIN_SUPPORTED_ABS_SCORE).
             en = (float) (pEn / sSum);
             vi = (float) (pVi / sSum);
             zh = (float) (pZh / sSum);
         }
-        return new LanguageScores(vi, en, zh, topCode, topIdx, topScore, 1);
+        return new LanguageScores(vi, en, zh,
+                (float) pVi, (float) pEn, (float) pZh,
+                topCode, topIdx, topScore, 1);
     }
 
     private static float[] runSession(OrtSession s, String featName, String lensName,

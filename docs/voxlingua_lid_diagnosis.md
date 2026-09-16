@@ -1,7 +1,39 @@
 # Chẩn đoán: bootstrap LID luôn kết luận "tiếng Việt" (VoxLingua107 ECAPA)
 
-Ngày: 2026-09-16 · Branch: `fakedemo2` (HEAD `eb511fc`) · **Trạng thái: chỉ chẩn đoán — chưa sửa code**
+Ngày: 2026-09-16 · Branch: `fakedemo2` · **Trạng thái: ĐÃ SỬA — Fix 1+2+3 landed (Java + Python mirror + tests)**
 Log nguồn: phiên chạy thật `com.omnivoice.onspeak47`, 16:14:45 – 16:15:25.
+
+> Cập nhật sau chẩn đoán: toàn bộ 3 hướng sửa bên dưới đã được triển khai —
+> cửa sổ LID tăng dần, gate absolute-mass (0.45) thay argmax-ghim,
+> provisional evidence-steered + referee mode + candidate bar 0.65/0.10,
+> serialize engine access (GetFrames race). Chi tiết xem `docs/streaming_asr.md`
+> ("2026-09-16" notes). Cần retest trên máy thật + validate FBank/ONNX parity
+> trước khi đánh giá accuracy.
+>
+> ## V2 — Field log 22:10–22:11 (APK đã chứa fix v1): abs bar 0.45 quá cao
+>
+> Log device cho thấy inference VoxLingua trả `en-rel 0.77–0.87` (ranking ĐÚNG
+> cho audio tiếng Anh) nhưng `enAbs chỉ 0.010–0.022` — thấp hơn 20–40 lần so
+> với bar 0.45 vốn tune trên 5 sample sạch (0.12–0.98). Hệ quả: gate không bao
+> giờ mở trên audio mic thật (xa, ồn, từ ngắn + silence) → UNKNOWN triền miên
+> → candidate one-shot decode rỗng → final rỗng. Log còn cho thấy single-window
+> rel cũng có thể sai (`adopted provisional vi conf=0.79` trên audio EN sau ~4s),
+> nên không thể chỉ hạ bar — cần persistence.
+>
+> Fix v2 (trong tree):
+>
+> - Gate 2 tầng: FAST (abs ≥ 0.45, audio sạch) + SLOW (relative 0.70/0.15 trên
+>   EMA + unanimity 3 hops + foreign-guard: argmax-unsupported ≥ 0.60 mới block).
+> - Confidence bootstrap = relative top (bỏ fusion-compression 0.90/0.10 làm
+>   router re-reject kết quả near-bar).
+> - Window onset-anchored (hết silence-dilution của lastMs); live MAX 2500→1500
+>   (ECAPA rẻ hơn, slow path commit từ window 600–1000 ms), endpoint giữ 2500.
+> - Validate trên model + sample thật: EN commit 800 ms, VI 1000 ms (rolling
+>   onset-anchored, smoother thật).
+>
+> Số đo E2E trong log (`Pipeline total: 2661 ms = Translation 737 ms + TTS
+> 1787 ms`, endpoint silence 2000 ms) cho thấy sau khi ASR commit sớm trở lại,
+> dư địa latency lớn nhất nằm ở MT/TTS + endpoint — xem phần trả lời latency.
 
 ## TL;DR
 

@@ -188,10 +188,15 @@ public class LanguageIdEngine {
      * <pre>bootstrapScore = 0.90 * acoustic + 0.10 * uniform prior</pre>
      *
      * VoxLingua path: when the injected engine exposes
-     * {@link AcousticLidEngine#classifyDetailed}, the global 107-class winner
-     * is enforced — an unsupported top (e.g. Japanese) returns UND even when
-     * the supported-relative margin looks confident, and a flat/weak global
-     * top stays UND (extend window / dual-candidate, never forced VI).
+     * {@link AcousticLidEngine#classifyDetailed}, a two-tier gate decides
+     * (§14–§15, 2026-09-16 v2): FAST (absolute supported mass) commits clean
+     * audio; SLOW (unanimous relative ranking + foreign-argmax guard)
+     * commits noisy device-mic audio whose 107-way mass stays flat while the
+     * relative ranking is correct. Either confident result commits — never
+     * the argmax label, never VI by default. Scores are the acoustic map
+     * itself and confidence is the relative top: blending toward the prior
+     * would compress the margin and make the router re-reject gated results
+     * sitting near the bar (mirrors the Python reference).
      *
      * Deliberately side-effect free: bootstrap must not drift the runtime
      * history/EMA. Returns UND with a flat score map when there is no audio
@@ -205,28 +210,20 @@ public class LanguageIdEngine {
             flat.put(AsrLanguage.ZH, 1.0f / 3);
             return new LidResult(AsrLanguage.UND, 0f, flat);
         }
-        // Preferred VoxLingua detailed path (§14): global-top policy first.
+        // Preferred VoxLingua detailed path (§14–§15): two-tier gate.
         if (lidEngine != null) {
             try {
                 LanguageScores detailed = lidEngine.classifyDetailed(audioWindow);
                 if (detailed != null && detailed.numWindows > 0) {
-                    if (!detailed.isSupportedTop()) {
+                    if (!detailed.isBootstrapConfident()
+                            && !detailed.isSlowBootstrapConfident()) {
                         return undFlat();
                     }
-                    if (detailed.globalTopScore
-                            < AsrState.VOXLINGUA_MIN_GLOBAL_SCORE) {
-                        return undFlat();
-                    }
-                    Map<AsrLanguage, Float> fused = new EnumMap<>(AsrLanguage.class);
-                    fused.put(AsrLanguage.VI, AsrState.BOOTSTRAP_W_ACOUSTIC * detailed.vi
-                            + AsrState.BOOTSTRAP_W_PRIOR * (1.0f / 3));
-                    fused.put(AsrLanguage.EN, AsrState.BOOTSTRAP_W_ACOUSTIC * detailed.en
-                            + AsrState.BOOTSTRAP_W_PRIOR * (1.0f / 3));
-                    fused.put(AsrLanguage.ZH, AsrState.BOOTSTRAP_W_ACOUSTIC * detailed.zh
-                            + AsrState.BOOTSTRAP_W_PRIOR * (1.0f / 3));
-                    normalize(fused);
-                    AsrLanguage best = bestOf(fused);
-                    return new LidResult(best, fused.get(best), new EnumMap<>(fused));
+                    Map<AsrLanguage, Float> acoustic = detailed.toMap();
+                    normalize(acoustic);
+                    AsrLanguage best = detailed.topSupported();
+                    return new LidResult(best, detailed.topSupportedScore(),
+                            new EnumMap<>(acoustic));
                 }
             } catch (Exception ignored) {
                 // Fall through to the Map path.

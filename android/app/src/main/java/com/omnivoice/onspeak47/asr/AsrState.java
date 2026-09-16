@@ -62,24 +62,69 @@ public final class AsrState {
     // on-device tuning, not absolute optima.
     /** Minimum speech audio before the first bootstrap attempt. */
     public static final int BOOTSTRAP_MIN_MS = 400;
-    /** Audio window fed to the acoustic LID classifier. */
-    public static final int BOOTSTRAP_LID_WINDOW_MS = 600;
+    /**
+     * Audio window fed to the acoustic LID classifier. 600 → 1500 ms
+     * (2026-09-16 LID-bootstrap fix): measured with the bundled VoxLingua107
+     * ECAPA export, a 600 ms window never gives a trustworthy 107-class
+     * argmax for English (eu/br/cy win instead) and only ~1 of 3 rolling
+     * windows clears the gate at all, while 1500 ms yields en 0.78 and vi
+     * 0.96+. See docs/voxlingua_lid_diagnosis.md.
+     */
+    public static final int BOOTSTRAP_LID_WINDOW_MS = 1500;
     /** Rolling hop between bootstrap attempts (temporal smoothing §16). */
     public static final int BOOTSTRAP_HOP_MS = 200;
-    /** Extended window when the first attempt is uncertain (§9 cách 1). */
-    public static final int BOOTSTRAP_MAX_MS = 1000;
+    /**
+     * Live growing-window cap (2026-09-16 v2: 2500 → 1500). ECAPA cost scales
+     * with frames and the slow bootstrap path (relative + 3-hop persistence)
+     * commits from 600–1000 ms windows; 1500 ms is plenty live. Endpoints use
+     * the wider {@link #BOOTSTRAP_ENDPOINT_WINDOW_MS} (no realtime pressure).
+     * Mirrors backend config.
+     */
+    public static final int BOOTSTRAP_MAX_MS = 1500;
+    /** Bootstrap window cap at VAD endpoints (mirrors backend config). */
+    public static final int BOOTSTRAP_ENDPOINT_WINDOW_MS = 2500;
     /** Give-up cap: past this much speech without a commit, stop burning
      *  speculative-candidate decodes (2 shadow decodes per pass) and keep
      *  only the hidden provisional stream — avoids a CPU decode storm on
      *  long UNKNOWN spans (unsupported language / noise). Endpoint recovery
      *  still gets one final chance. */
-    public static final int BOOTSTRAP_GIVE_UP_MS = 3000;
+    public static final int BOOTSTRAP_GIVE_UP_MS = 6000;
     /** Cooldown between speculative-candidate passes (each pass = ≤2 decodes). */
     public static final int SPECULATIVE_CANDIDATE_COOLDOWN_MS = 800;
     /** top1 must reach this to commit a bootstrap language. */
     public static final float BOOTSTRAP_THRESHOLD = 0.70f;
     /** top1 - top2 must reach this (never force VI on max-probability). */
     public static final float BOOTSTRAP_MARGIN = 0.15f;
+    /**
+     * Unified bar for the speculative-candidate path (2026-09-16 fix): a
+     * one-shot decode used to commit a language at 0.30 (0.65*conf +
+     * 0.35*lexicalFit) while the acoustic gate demands 0.70 — so every
+     * rejected LID fell through to a low-confidence commit, and because the
+     * candidate pair defaulted to [VI, EN] that commit was almost always
+     * Vietnamese. Candidates now need the same evidence level as an acoustic
+     * commit.
+     */
+    public static final float CANDIDATE_COMMIT_SCORE = 0.65f;
+    /** Winner must beat the runner-up by this (no coin-flip commits). */
+    public static final float CANDIDATE_MARGIN = 0.10f;
+    /**
+     * Minimum supported-relative score before the provisional (hidden)
+     * decoder follows uncertain LID evidence away from VI. Below this the
+     * pipeline keeps the current provisional audible (avoids silence on
+     * noisy starts); when the evidence names a non-resident engine the UI
+     * stays quiet instead of decoding on a guess — the old behaviour
+     * hard-coded VI here.
+     */
+    public static final float PROVISIONAL_MIN_SUPPORTED_REL = 0.60f;
+    /**
+     * Max bootstrap/referee classifies per decision phase (§6.1). The budget
+     * is refreshed on every commit, so a weak fallback commit gets its own 6
+     * referee passes. The dynamic-window ECAPA pass is up to ~4× the cost of
+     * the 480 ms runtime window; after the budget the runtime LID and
+     * endpoint verification remain as the correction paths (CPU bound, not a
+     * correctness bound).
+     */
+    public static final int REFEREE_MAX_ATTEMPTS = 6;
     /** bootstrapScore = 0.90 * acoustic + 0.10 * prior (text/history off). */
     public static final float BOOTSTRAP_W_ACOUSTIC = 0.90f;
     public static final float BOOTSTRAP_W_PRIOR = 0.10f;
@@ -185,6 +230,41 @@ public final class AsrState {
     public static final int VOXLINGUA_N_MELS = 60;
     /** Absolute global-top floor: below this the window is too flat to trust
      *  even when the supported-relative margin passes (107-way uniform ≈
-     *  0.009). Starting point for tuning, not a guarantee. */
+     *  0.009). Starting point for tuning, not a guarantee.
+     *
+     *  LEGACY (2026-09-16): the bootstrap gate no longer reads this — the
+     *  107-class argmax proved unreliable at the pipeline's window sizes, so
+     *  the gate moved to VOXLINGUA_MIN_SUPPORTED_ABS_SCORE. Kept because the
+     *  value still documents the "too flat to trust" floor and the Python
+     *  reference exports it. */
     public static final float VOXLINGUA_MIN_GLOBAL_SCORE = 0.25f;
+    /**
+     * Minimum EMA absolute probability of the supported winner (en/vi/zh) for
+     * a bootstrap commit (2026-09-16 LID-bootstrap fix). Replaces the old
+     * "the 107-class argmax must be en/vi/zh" requirement: on a 400–600 ms
+     * window the ECAPA argmax is regularly an unrelated language
+     * (eu/br/cy/nn/ja/lo) while the supported-relative evidence is already
+     * 0.93–1.00, so the argmax rule rejected every English/Chinese utterance
+     * and left the VI-biased fallback in charge.
+     *
+     * Measured on the bundled samples: abs(en) ≈ 0.12 @600 ms, 0.78 @1500 ms;
+     * abs(vi) ≈ 0.88–0.97 @600–1000 ms (hence the 1500 ms window above).
+     * The high absolute value protects the §14 policy the argmax rule was
+     * written for: Japanese audio scores abs(zh) ≈ 0.05, far below this bar.
+     */
+    public static final float VOXLINGUA_MIN_SUPPORTED_ABS_SCORE = 0.45f;
+    /**
+     * Foreign-audio guard for the SLOW bootstrap path (2026-09-16 v2): a
+     * STRONG unsupported 107-class argmax means true foreign audio — wait
+     * instead of forcing VI/EN/ZH. Weak/flat argmax tops (the normal
+     * short-window case on device mic audio, e.g. nn 0.26) do NOT block the
+     * slow path. Mirrors backend config.
+     */
+    public static final float VOXLINGUA_FOREIGN_TOP_REJECT = 0.60f;
+    /**
+     * EMA coefficient for the smoothed absolute supported posteriors
+     * (VoxLinguaTemporalSmoother §16). Lower than EMA_ALPHA would smooth
+     * more; 0.4 keeps the referee inside the 200 ms hop budget.
+     */
+    public static final float LID_EMA_ALPHA = 0.4f;
 }

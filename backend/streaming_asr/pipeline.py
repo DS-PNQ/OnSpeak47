@@ -11,7 +11,10 @@ from .config import (FRAME_MS, FRAME_SAMPLES, SAMPLE_RATE, SCHEDULER_MS,
                       ENDPOINT_VERIFY_STRONG_LEX, ENDPOINT_VERIFY_MIN_TOKENS,
                       BOOTSTRAP_MIN_MS, BOOTSTRAP_LID_WINDOW_MS,
                       BOOTSTRAP_HOP_MS, BOOTSTRAP_MAX_MS,
-                      BOOTSTRAP_GIVE_UP_MS,
+                      BOOTSTRAP_ENDPOINT_WINDOW_MS,
+                      BOOTSTRAP_GIVE_UP_MS, BOOTSTRAP_THRESHOLD,
+                      CANDIDATE_COMMIT_SCORE, CANDIDATE_MARGIN,
+                      PROVISIONAL_MIN_SUPPORTED_REL, REFEREE_MAX_ATTEMPTS,
                       SPECULATIVE_CANDIDATE_COOLDOWN_MS)
 from .ring_buffer import AudioRingBuffer
 from .vad import VadEngine
@@ -59,16 +62,25 @@ class StreamingPipeline:
         self._last_candidate_speech_ms = -1
         self._last_candidate_pair = None
         self._utterance_start_sample = -1
+        # --- Referee state (§6.1): solidity of the active decision + budget.
+        self._bootstrap_commit_conf = 0.0
+        self._last_referee_speech_ms = -1
         # --- Provisional speculative decode (Option A hotfix) ---
-        # While UNKNOWN the pipeline ALSO decodes continuously on VI so
-        # partials flow after ~160 ms. Provisional text stays outside the
-        # shared transcript manager: adopted on same-language commit,
-        # discarded without a trace otherwise (§11).
+        # While UNKNOWN the pipeline ALSO decodes continuously so partials
+        # flow after ~160 ms. Provisional text stays outside the shared
+        # transcript manager: adopted on same-language commit, discarded
+        # without a trace otherwise (§11). 2026-09-16 fix: the provisional
+        # decoder no longer hard-locks VI — uncertain LID evidence steers it
+        # (or quiets the UI) via _apply_provisional_policy.
         self._provisional_asr = None
         self._provisional_lang = "vi"
         self._provisional_text = ""
         self._provisional_conf = 1.0 / 3
         self._last_posted_provisional = ""
+        self._provisional_quiet = False
+        self._provisional_complete = True
+        self._last_uncertain_top = None
+        self._referee_attempts = 0
         self._reset_provisional()
         self.events = []  # ("partial"|"final"|"switch", payload...)
 
@@ -97,6 +109,11 @@ class StreamingPipeline:
             return
         # 160 ms scheduler accumulation on the active stream.
         self._accumulate_scheduler(frame, now, provisional=False)
+        # Referee mode (§6.1, mirrors Java): after a WEAK commit the growing-
+        # window acoustic LID keeps re-evaluating; a confident disagreement
+        # goes through the runtime hysteresis/rollback gate, never a switch.
+        if self._bootstrap_commit_conf < BOOTSTRAP_THRESHOLD:
+            self._try_referee_lid()
         uncertain = self.router.state != "ACTIVE"
         has_candidate = self.router.candidate is not None
         interval = LanguageIdEngine.lid_interval_ms(uncertain, has_candidate)
@@ -109,18 +126,53 @@ class StreamingPipeline:
             # blind the router to intra-utterance switches.
             r = self.lid.classify(window, self._recent_text(6),
                                   self.active_asr.confidence, self.active_lang)
-            d = self.router.on_lid_result(r)
-            if d == "START_ROLLBACK":
-                w = self.rollback.start_rollback(self.ring, r.language, now)
-                out = self.router.verify_and_commit(w)
-                if out == "COMMITTED":
-                    self._on_committed(r.language, w)
-                else:
-                    self.transcripts.rollback_speculative()
+            self._on_runtime_lid(r, now)
+
+    def _on_runtime_lid(self, r, now: int) -> None:
+        """Feed one runtime/referee verdict into hysteresis + verification."""
+        d = self.router.on_lid_result(r)
+        if d == "START_ROLLBACK":
+            w = self.rollback.start_rollback(self.ring, r.language, now)
+            out = self.router.verify_and_commit(w)
+            if out == "COMMITTED":
+                self._on_committed(r.language, w)
+            else:
+                self.transcripts.rollback_speculative()
+
+    def _try_referee_lid(self) -> None:
+        """One sync referee pass after a weak commit (mirrors Java).
+
+        Speech-gated (800 ms) and budget-capped. Agreement firms the
+        decision (stopping the referee); disagreement reuses the runtime
+        gate. Never commits or switches by itself.
+        """
+        if self.active_lang == "und" or self.active_asr is None:
+            return
+        if self._referee_attempts >= REFEREE_MAX_ATTEMPTS:
+            return
+        if (self._utterance_speech_ms - self._last_referee_speech_ms
+                < SPECULATIVE_CANDIDATE_COOLDOWN_MS):
+            return
+        self._last_referee_speech_ms = self._utterance_speech_ms
+        self._referee_attempts += 1
+        window_ms = min(BOOTSTRAP_MAX_MS,
+                        max(BOOTSTRAP_LID_WINDOW_MS, self._utterance_speech_ms))
+        r = self.lid.classify_bootstrap(self.ring.last_ms(window_ms))
+        if r.language == "und" or r.language == self.active_lang:
+            if r.confidence >= BOOTSTRAP_THRESHOLD:
+                self._bootstrap_commit_conf = r.confidence
+            return
+        self._on_runtime_lid(r, self.clock())
 
     # -- bootstrap acoustic LID (§7–§9, §14–§15, §24–§27, §32) --------
     def _try_bootstrap_lid(self) -> None:
-        """One sync bootstrap attempt when enough speech has accumulated."""
+        """One sync bootstrap attempt when enough speech has accumulated.
+
+        2026-09-16 fix: the LID window GROWS with the accumulated speech
+        (baseline → MAX) instead of a fixed 600 ms — a fixed short window
+        sits below the ECAPA argmax-flip point for EN (~1.5 s) and VI
+        (~1.0 s). Referee submits are capped per utterance (CPU bound).
+        """
         if self.active_lang != "und":
             return
         if self._utterance_speech_ms < BOOTSTRAP_MIN_MS:
@@ -130,15 +182,24 @@ class StreamingPipeline:
                      < BOOTSTRAP_HOP_MS)):
             return
         self._last_bootstrap_speech_ms = self._utterance_speech_ms
-        window = self.ring.last_ms(BOOTSTRAP_LID_WINDOW_MS)
+        self._referee_attempts += 1
+        window_ms = min(BOOTSTRAP_MAX_MS,
+                        max(BOOTSTRAP_LID_WINDOW_MS, self._utterance_speech_ms))
+        # Onset-anchored (2026-09-16 v2): lastMs dilutes the window with
+        # trailing/pre-speech silence as it grows — score the utterance audio
+        # itself, oldest-first, like the commit replay does.
+        window = self._utterance_audio(window_ms)
         r = self.lid.classify_bootstrap(window)
         decided = self.router.on_bootstrap_lid_result(r)
         if decided != "und":
             self._activate_bootstrap(decided, r.confidence)
             return
-        # Uncertain: collect up to BOOTSTRAP_MAX_MS (§9 cách 1), then ≤2
-        # speculative candidates (§32) — never force VI on max-probability.
-        if self._utterance_speech_ms < BOOTSTRAP_MAX_MS:
+        self._apply_provisional_policy(r)
+        # Uncertain: keep collecting while the window still grows and referee
+        # budget remains, then ≤2 speculative candidates (§32) — never force
+        # VI on max-probability.
+        if (self._utterance_speech_ms < BOOTSTRAP_MAX_MS
+                and self._referee_attempts < REFEREE_MAX_ATTEMPTS):
             return
         # Cooldown: a candidate pass costs 2 shadow decodes — rerun at most
         # every SPECULATIVE_CANDIDATE_COOLDOWN_MS of additional audio.
@@ -153,6 +214,51 @@ class StreamingPipeline:
         self._last_candidate_speech_ms = self._utterance_speech_ms
         self._run_speculative_candidates(r)
 
+    def _apply_provisional_policy(self, r) -> None:
+        """Steer the hidden provisional decoder from uncertain LID evidence.
+
+        2026-09-16 fix (§6.2): the provisional decoder no longer hard-locks
+        VI. When the fused evidence persistently (2 agreeing hops) leans to
+        another language strongly enough, the provisional stream follows it —
+        so the adopt fast-path works for EN/ZH too and live partials are
+        decoded in the right language. When that engine is not resident the
+        UI stays quiet instead of showing VI-decoded garbage for foreign
+        audio (the log symptom: English rendered as "ĐI HỌC"). Weak evidence
+        keeps the current provisional audible (avoids silence on noisy
+        starts). Never lazy-loads on the live path.
+        """
+        scores = r.scores if r is not None else None
+        if not scores:
+            return
+        order = ("vi", "en", "zh")
+        top = max(order, key=lambda l: scores.get(l) or 0.0)
+        top_score = scores.get(top) or 0.0
+        persistent = (top == self._last_uncertain_top)
+        self._last_uncertain_top = top
+        if top == self._provisional_lang:
+            self._provisional_quiet = False
+            return
+        if top_score < PROVISIONAL_MIN_SUPPORTED_REL or not persistent:
+            return
+        if self.models.is_resident(top):
+            try:
+                eng = self.models.get(top)
+                eng.reset()
+            except Exception:
+                return
+            self._provisional_asr = eng
+            self._provisional_lang = top
+            self._provisional_text = ""
+            self._provisional_conf = 1.0 / 3
+            self._last_posted_provisional = ""
+            self._provisional_quiet = False
+            # Switched mid-utterance: this stream no longer holds the head
+            # audio, so a later commit to this language must replay (no
+            # adopt) — see _activate_bootstrap.
+            self._provisional_complete = False
+        else:
+            self._provisional_quiet = True
+
     def _utterance_audio(self, max_ms: int):
         """Utterance audio from speech onset, oldest-first, capped at max_ms.
 
@@ -166,17 +272,21 @@ class StreamingPipeline:
     def _activate_bootstrap(self, lang: str, confidence: float) -> None:
         """Commit the bootstrap winner — adopt or rollback.
 
-        Winner == provisional language → adopt the live stream as-is (no
-        reset, no replay). Otherwise discard the provisional text without a
-        trace and REPLAY the buffered utterance audio into the winner
-        (§15, §25).
+        Winner == provisional language AND the provisional stream holds the
+        whole utterance (no mid-utterance engine switch) → adopt the live
+        stream as-is (no reset, no replay). Otherwise discard the provisional
+        text without a trace and REPLAY the buffered utterance audio into
+        the winner (§15, §25).
         """
         if self.active_lang != "und" or not lang or lang == "und":
             return
-        if lang == self._provisional_lang and self._provisional_asr is not None:
+        if (lang == self._provisional_lang and self._provisional_asr is not None
+                and self._provisional_complete):
             self.active_lang = lang
             self.active_asr = self._provisional_asr
             self._provisional_asr = None
+            self._bootstrap_commit_conf = confidence
+            self._referee_attempts = 0  # fresh referee budget for weak commits
             self.router.commit_bootstrap(lang, confidence)
             self.transcripts.update_speculative(self._provisional_text)
             self.events.append(("partial", self.transcripts.committed,
@@ -187,10 +297,13 @@ class StreamingPipeline:
         self._provisional_text = ""
         self._last_posted_provisional = ""
         self._provisional_asr = None
+        self._provisional_quiet = False
         self._sched_buf = []  # replay below re-covers this audio from the ring
         self.active_lang = lang
         self.active_asr = self.models.get(lang)
         self.active_asr.reset()
+        self._bootstrap_commit_conf = confidence
+        self._referee_attempts = 0  # fresh referee budget for weak commits
         self.router.commit_bootstrap(lang, confidence)
         # Replay from the utterance start (§15, §25) — not last_ms, so a
         # mid-utterance pause can't shift the window onto silence.
@@ -207,7 +320,7 @@ class StreamingPipeline:
 
     def _run_speculative_candidates(self, r) -> None:
         """Uncertain fallback (§32): one-shot decode on at most top-2 models."""
-        window = self.ring.last_ms(BOOTSTRAP_MAX_MS)
+        window = self._utterance_audio(BOOTSTRAP_MAX_MS)
         # Too-short window → decode would be garbage + burn 2 engines.
         if not window or len(window) < SAMPLE_RATE * 400 // 1000:
             return
@@ -243,6 +356,7 @@ class StreamingPipeline:
             return
         self._last_candidate_pair = list(pair)
         winner, winner_score, winner_conf = None, -1.0, 0.0
+        second_score = -1.0
         for cand in pair:
             if not cand or cand == "und":
                 continue
@@ -254,13 +368,27 @@ class StreamingPipeline:
                 continue
             combined = 0.65 * conf + 0.35 * lexical_fit(text, cand)
             if combined > winner_score:
+                second_score = winner_score
                 winner, winner_score, winner_conf = cand, combined, conf
-        if winner is not None and winner_score >= 0.30:
+            elif combined > second_score:
+                second_score = combined
+        # 2026-09-16 fix: the old 0.30 bar committed a language on weak
+        # one-shot evidence (VI won at 0.32 in the field log). Candidates now
+        # need acoustic-commit-level evidence plus a margin over the
+        # runner-up; the confidence stays capped below the 0.70 acoustic bar
+        # so runtime LID can still correct a fallback commit.
+        if (winner is not None and winner_score >= CANDIDATE_COMMIT_SCORE
+                and (winner_score - second_score) >= CANDIDATE_MARGIN):
             self._activate_bootstrap(winner, min(winner_score, 0.69))
 
     @staticmethod
     def _top_two(scores) -> list:
-        order = ["vi", "en", "zh"]
+        # 2026-09-16 fix: tie-break order deliberately does NOT lead with VI.
+        # The old ["vi", "en", "zh"] order returned [VI, EN] on every flat /
+        # uncertain score map, and with the 0.30 candidate bar the fallback
+        # commit was almost always Vietnamese. Rotation
+        # (_choose_candidate_pair) still covers the third language next pass.
+        order = ["en", "zh", "vi"]
         if scores:
             order = sorted(order, key=lambda l: -(scores.get(l) or 0.0))
         return order[:2]
@@ -306,6 +434,9 @@ class StreamingPipeline:
         self._provisional_text = ""
         self._provisional_conf = 1.0 / 3
         self._last_posted_provisional = ""
+        self._provisional_quiet = False
+        self._provisional_complete = True
+        self._last_uncertain_top = None
         try:
             self._provisional_asr = self.models.get("vi")
             self._provisional_asr.reset()
@@ -331,7 +462,12 @@ class StreamingPipeline:
         self._provisional_text = text or ""
         self._provisional_conf = conf
         self.metrics.add_partial_latency(max(0, self.clock() - audio_time_ms))
-        if self._provisional_text and self._provisional_text != self._last_posted_provisional:
+        # The decode keeps running even while quiet (the adopt fast-path
+        # needs the live stream state); only the UI post is gated — foreign
+        # audio must not render as VI-guess text.
+        if (self._provisional_text
+                and self._provisional_text != self._last_posted_provisional
+                and not self._provisional_quiet):
             self._last_posted_provisional = self._provisional_text
             self.events.append(("partial", "", self._provisional_text,
                                 self._provisional_lang))
@@ -370,6 +506,8 @@ class StreamingPipeline:
         self.transcripts.commit(text)
         self.active_lang = nxt
         self.active_asr = cand
+        self._bootstrap_commit_conf = conf
+        self._referee_attempts = 0
         self.router.set_active(nxt, conf)
         self.active_asr.accept_audio(window)
         self.events.append(("switch", prev, nxt))
@@ -473,9 +611,12 @@ class StreamingPipeline:
                     self._provisional_conf = self._provisional_asr.confidence
             # Read from the utterance start: at an endpoint last_ms would
             # return mostly the trailing silence (§35 short utterances).
+            # Bootstrap replays up to the ENDPOINT window (wider than the live
+            # cap): at an endpoint there is no realtime pressure, so use all
+            # evidence.
             spoken = self._utterance_audio(ENDPOINT_VERIFY_MS)
-            window = (spoken[:16000 * BOOTSTRAP_LID_WINDOW_MS // 1000]
-                      if len(spoken) > 16000 * BOOTSTRAP_LID_WINDOW_MS // 1000
+            window = (spoken[:16000 * BOOTSTRAP_ENDPOINT_WINDOW_MS // 1000]
+                      if len(spoken) > 16000 * BOOTSTRAP_ENDPOINT_WINDOW_MS // 1000
                       else spoken)
             r = self.lid.classify_bootstrap(window)
             decided = self.router.on_bootstrap_lid_result(r)
@@ -553,6 +694,9 @@ class StreamingPipeline:
         self._last_candidate_pair = None
         self._utterance_start_sample = -1
         self._utterance_seq += 1
+        self._referee_attempts = 0
+        self._bootstrap_commit_conf = 0.0
+        self._last_referee_speech_ms = -1
         self._reset_provisional()
 
     def _adopt_provisional(self, confidence: float) -> None:
