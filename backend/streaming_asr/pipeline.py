@@ -10,7 +10,9 @@ from .config import (FRAME_MS, FRAME_SAMPLES, SAMPLE_RATE, SCHEDULER_MS,
                       ENDPOINT_VERIFY_MARGIN, ENDPOINT_VERIFY_LEX_W,
                       ENDPOINT_VERIFY_STRONG_LEX, ENDPOINT_VERIFY_MIN_TOKENS,
                       BOOTSTRAP_MIN_MS, BOOTSTRAP_LID_WINDOW_MS,
-                      BOOTSTRAP_MAX_MS)
+                      BOOTSTRAP_HOP_MS, BOOTSTRAP_MAX_MS,
+                      BOOTSTRAP_GIVE_UP_MS,
+                      SPECULATIVE_CANDIDATE_COOLDOWN_MS)
 from .ring_buffer import AudioRingBuffer
 from .vad import VadEngine
 from .lid import (LanguageIdEngine, text_units, lexical_fit,
@@ -66,6 +68,7 @@ class StreamingPipeline:
         self._provisional_lang = "vi"
         self._provisional_text = ""
         self._provisional_conf = 1.0 / 3
+        self._last_posted_provisional = ""
         self._reset_provisional()
         self.events = []  # ("partial"|"final"|"switch", payload...)
 
@@ -95,7 +98,8 @@ class StreamingPipeline:
         # 160 ms scheduler accumulation on the active stream.
         self._accumulate_scheduler(frame, now, provisional=False)
         uncertain = self.router.state != "ACTIVE"
-        interval = LanguageIdEngine.lid_interval_ms(uncertain)
+        has_candidate = self.router.candidate is not None
+        interval = LanguageIdEngine.lid_interval_ms(uncertain, has_candidate)
         if now - self._last_lid_ms >= interval:
             self._last_lid_ms = now
             window = self.ring.last_ms(LID_WINDOW_MS)
@@ -123,8 +127,7 @@ class StreamingPipeline:
             return
         if (self._last_bootstrap_speech_ms >= 0
                 and (self._utterance_speech_ms - self._last_bootstrap_speech_ms
-                     < SCHEDULER_MS)
-                and self._utterance_speech_ms >= BOOTSTRAP_MAX_MS):
+                     < BOOTSTRAP_HOP_MS)):
             return
         self._last_bootstrap_speech_ms = self._utterance_speech_ms
         window = self.ring.last_ms(BOOTSTRAP_LID_WINDOW_MS)
@@ -138,9 +141,14 @@ class StreamingPipeline:
         if self._utterance_speech_ms < BOOTSTRAP_MAX_MS:
             return
         # Cooldown: a candidate pass costs 2 shadow decodes — rerun at most
-        # every 800 ms of additional audio, not every tick.
+        # every SPECULATIVE_CANDIDATE_COOLDOWN_MS of additional audio.
         since_cand = self._utterance_speech_ms - self._last_candidate_speech_ms
-        if self._last_candidate_speech_ms >= 0 and since_cand < 800:
+        if self._last_candidate_speech_ms >= 0 and since_cand < SPECULATIVE_CANDIDATE_COOLDOWN_MS:
+            return
+        # Give-up: past BOOTSTRAP_GIVE_UP_MS without a commit, stop burning
+        # candidate decodes; hidden provisional keeps flowing and endpoint
+        # recovery still gets one final chance.
+        if self._utterance_speech_ms > BOOTSTRAP_GIVE_UP_MS:
             return
         self._last_candidate_speech_ms = self._utterance_speech_ms
         self._run_speculative_candidates(r)
@@ -174,8 +182,10 @@ class StreamingPipeline:
             self.events.append(("partial", self.transcripts.committed,
                                 self.transcripts.speculative, lang))
             self._provisional_text = ""
+            self._last_posted_provisional = ""
             return
         self._provisional_text = ""
+        self._last_posted_provisional = ""
         self._provisional_asr = None
         self._sched_buf = []  # replay below re-covers this audio from the ring
         self.active_lang = lang
@@ -197,8 +207,12 @@ class StreamingPipeline:
 
     def _run_speculative_candidates(self, r) -> None:
         """Uncertain fallback (§32): one-shot decode on at most top-2 models."""
+        window = self.ring.last_ms(BOOTSTRAP_MAX_MS)
+        # Too-short window → decode would be garbage + burn 2 engines.
+        if not window or len(window) < SAMPLE_RATE * 400 // 1000:
+            return
         self._run_speculative_candidates_on(
-            r, self.ring.last_ms(BOOTSTRAP_MAX_MS),
+            r, window,
             self._choose_candidate_pair(r.scores if r is not None else None))
 
     def _choose_candidate_pair(self, scores) -> list:
@@ -291,6 +305,7 @@ class StreamingPipeline:
         self._provisional_lang = "vi"
         self._provisional_text = ""
         self._provisional_conf = 1.0 / 3
+        self._last_posted_provisional = ""
         try:
             self._provisional_asr = self.models.get("vi")
             self._provisional_asr.reset()
@@ -298,7 +313,11 @@ class StreamingPipeline:
             self._provisional_asr = None
 
     def _decode_provisional(self, chunk, audio_time_ms: int) -> None:
-        """Continuous speculative partials on VI while UNKNOWN (Option A)."""
+        """Continuous speculative partials on VI while UNKNOWN (Option A).
+
+        The decode keeps running (adopt fast-path needs live stream state),
+        but UI posts are hidden speculative-only and de-duplicated.
+        """
         if self._provisional_asr is None:
             try:
                 self._provisional_asr = self.models.get("vi")
@@ -312,7 +331,8 @@ class StreamingPipeline:
         self._provisional_text = text or ""
         self._provisional_conf = conf
         self.metrics.add_partial_latency(max(0, self.clock() - audio_time_ms))
-        if self._provisional_text:
+        if self._provisional_text and self._provisional_text != self._last_posted_provisional:
+            self._last_posted_provisional = self._provisional_text
             self.events.append(("partial", "", self._provisional_text,
                                 self._provisional_lang))
     def _decode_chunk(self, chunk, audio_time_ms: int):
@@ -521,6 +541,10 @@ class StreamingPipeline:
         self.active_asr = None
         self.active_lang = "und"
         self.router.reset()
+        try:
+            self.lid.reset()
+        except Exception:
+            pass
         self._sched_buf = []
         self._utterance_start = -1
         self._utterance_speech_ms = 0
@@ -542,6 +566,7 @@ class StreamingPipeline:
         self.router.commit_bootstrap(self.active_lang, confidence)
         self.transcripts.update_speculative(self._provisional_text)
         self._provisional_text = ""
+        self._last_posted_provisional = ""
 
     def _verify_endpoint_language(self, base_text: str, base_conf: float,
                                   base_lang: str = None):

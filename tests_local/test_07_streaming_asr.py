@@ -400,7 +400,7 @@ def test_pipeline_en_utterance_starts_with_en_recognizer():
     p = StreamingPipeline(clock=clock, factory=factory,
                           acoustic_scorer=lambda audio: {"en": 0.86, "vi": 0.09, "zh": 0.05})
     t = 0
-    for _ in range(15):  # 300 ms — bootstrap commits at ~200 ms
+    for _ in range(25):  # 500 ms — passes BOOTSTRAP_MIN_MS (400 ms)
         t += 20
         now[0] = t
         p.on_frame(_speech_frame(), t)
@@ -736,3 +736,180 @@ def test_endpoint_flushes_scheduler_residue_without_leak():
         p.on_frame([0.0] * 320, t)
     finals = [e for e in p.events if e[0] == "final"]
     assert finals[-1][1] == "hai", "tail leaked across utterances: %r" % finals[-1][1]
+
+
+# --- VoxLingua107 ECAPA acoustic LID tests (pipeline §4, §11–§16) -------------
+
+def test_voxlingua_labels():
+    from backend.streaming_asr.voxlingua import VoxLinguaLabels
+    assert VoxLinguaLabels.NUM_LANGUAGES == 107
+    assert VoxLinguaLabels.IDX_EN == 20
+    assert VoxLinguaLabels.IDX_VI == 102
+    assert VoxLinguaLabels.IDX_ZH == 106
+    assert VoxLinguaLabels.code_at(20) == "en"
+    assert VoxLinguaLabels.code_at(102) == "vi"
+    assert VoxLinguaLabels.code_at(106) == "zh"
+    assert VoxLinguaLabels.is_supported("vi")
+    assert VoxLinguaLabels.is_supported("en")
+    assert VoxLinguaLabels.is_supported("zh")
+    assert not VoxLinguaLabels.is_supported("ja")
+    assert not VoxLinguaLabels.is_supported("th")
+    assert VoxLinguaLabels.to_asr_language("vi") == "vi"
+    assert VoxLinguaLabels.to_asr_language("ja") == "und"
+
+
+def test_voxlingua_scores_bootstrap_gate():
+    from backend.streaming_asr.voxlingua import LanguageScores
+    flat = LanguageScores.flat()
+    assert not flat.is_supported_top()
+    assert not flat.is_bootstrap_confident()
+
+    confident_en = LanguageScores(
+        vi=0.05, en=0.85, zh=0.10,
+        global_top_language="en", global_top_index=20, global_top_score=0.80, num_windows=1
+    )
+    assert confident_en.is_supported_top()
+    assert confident_en.top_supported() == "en"
+    assert confident_en.is_bootstrap_confident()
+
+    # Narrow margin
+    narrow = LanguageScores(
+        vi=0.45, en=0.42, zh=0.13,
+        global_top_language="vi", global_top_index=102, global_top_score=0.40, num_windows=1
+    )
+    assert not narrow.is_bootstrap_confident()
+
+    # Unsupported global top (Japanese)
+    ja_top = LanguageScores(
+        vi=0.10, en=0.85, zh=0.05,
+        global_top_language="ja", global_top_index=45, global_top_score=0.80, num_windows=1
+    )
+    assert not ja_top.is_supported_top()
+    assert not ja_top.is_bootstrap_confident()
+
+
+def test_voxlingua_fbank_extractor():
+    import numpy as np
+    from backend.streaming_asr.voxlingua import VoxLinguaFbankExtractor
+
+    extractor = VoxLinguaFbankExtractor()
+    assert len(extractor.extract(None)) == 0
+    assert len(extractor.extract(np.zeros(200))) == 0
+
+    # 1 second of synthetic signal @ 16 kHz
+    t = np.linspace(0, 1, 16000, endpoint=False)
+    audio = (0.3 * np.sin(2 * np.pi * 400 * t)).astype(np.float32)
+    feats = extractor.extract(audio)
+
+    assert feats.ndim == 2
+    assert feats.shape[1] == VoxLinguaFbankExtractor.N_MELS
+    expected_frames = VoxLinguaFbankExtractor.num_frames_for(16000)
+    assert feats.shape[0] == expected_frames
+
+    # Sentence-mean normalization: each mel bin mean across frames should be ~0
+    bin_means = np.mean(feats, axis=0)
+    assert np.allclose(bin_means, 0.0, atol=1e-4)
+
+
+def test_voxlingua_temporal_smoother():
+    from backend.streaming_asr.voxlingua import VoxLinguaTemporalSmoother, LanguageScores
+
+    smoother = VoxLinguaTemporalSmoother()
+    assert smoother.size == 0
+
+    s1 = smoother.add(LanguageScores(vi=0.40, en=0.50, zh=0.10, global_top_language="en",
+                                     global_top_index=20, global_top_score=0.45, num_windows=1))
+    assert smoother.size == 1
+    assert s1.top_supported() == "en"
+
+    s2 = smoother.add(LanguageScores(vi=0.20, en=0.75, zh=0.05, global_top_language="en",
+                                     global_top_index=20, global_top_score=0.70, num_windows=1))
+    assert smoother.size == 2
+
+    s3 = smoother.add(LanguageScores(vi=0.10, en=0.85, zh=0.05, global_top_language="en",
+                                     global_top_index=20, global_top_score=0.80, num_windows=1))
+    assert smoother.size == 3
+    assert s3.is_bootstrap_confident()
+    assert s3.top_supported() == "en"
+
+    smoother.reset()
+    assert smoother.size == 0
+
+
+def test_voxlingua_scores_from_logits():
+    import numpy as np
+    from backend.streaming_asr.voxlingua import VoxLinguaLabels, scores_from_logits
+
+    logits = np.zeros(VoxLinguaLabels.NUM_LANGUAGES, dtype=np.float32)
+    logits[VoxLinguaLabels.IDX_VI] = 12.0
+    s_vi = scores_from_logits(logits)
+    assert s_vi.global_top_language == "vi"
+    assert s_vi.is_supported_top()
+    assert s_vi.top_supported() == "vi"
+    assert s_vi.is_bootstrap_confident()
+
+    logits[:] = 0.0
+    logits[VoxLinguaLabels.IDX_EN] = 12.0
+    s_en = scores_from_logits(logits)
+    assert s_en.global_top_language == "en"
+    assert s_en.is_supported_top()
+    assert s_en.top_supported() == "en"
+    assert s_en.is_bootstrap_confident()
+
+    logits[:] = 0.0
+    ja_idx = VoxLinguaLabels.index_of("ja")
+    assert ja_idx >= 0
+    logits[ja_idx] = 12.0
+    s_ja = scores_from_logits(logits)
+    assert s_ja.global_top_language == "ja"
+    assert not s_ja.is_supported_top()
+    assert not s_ja.is_bootstrap_confident()
+
+
+def test_language_id_engine_voxlingua_integration():
+    from backend.streaming_asr.lid import LanguageIdEngine
+    from backend.streaming_asr.voxlingua import LanguageScores
+    from backend.streaming_asr.config import (
+        LID_INTERVAL_CANDIDATE_MS,
+        LID_INTERVAL_UNCERTAIN_MS,
+        LID_INTERVAL_STABLE_MS,
+    )
+
+    class MockDetailedEngine:
+        def __init__(self, detailed):
+            self.detailed = detailed
+
+        def classify_detailed(self, audio):
+            return self.detailed
+
+        def classify(self, audio):
+            return self.detailed.to_map()
+
+        def is_ready(self):
+            return True
+
+    # 1. Unsupported global winner -> UND flat
+    ja_scorer = MockDetailedEngine(
+        LanguageScores(vi=0.80, en=0.15, zh=0.05, global_top_language="ja",
+                       global_top_index=45, global_top_score=0.85, num_windows=1)
+    )
+    lid_ja = LanguageIdEngine(acoustic_scorer=ja_scorer)
+    r_ja = lid_ja.classify_bootstrap([0.1] * 4800)
+    assert r_ja.language == "und"
+    assert abs(r_ja.scores["vi"] - 1.0 / 3) < 1e-5
+
+    # 2. Confident EN -> EN commits
+    en_scorer = MockDetailedEngine(
+        LanguageScores(vi=0.05, en=0.90, zh=0.05, global_top_language="en",
+                       global_top_index=20, global_top_score=0.88, num_windows=1)
+    )
+    lid_en = LanguageIdEngine(acoustic_scorer=en_scorer)
+    r_en = lid_en.classify_bootstrap([0.1] * 4800)
+    assert r_en.language == "en"
+    assert r_en.confidence >= 0.70
+
+    # 3. 3-level intervals
+    assert LanguageIdEngine.lid_interval_ms(False, has_candidate=True) == LID_INTERVAL_CANDIDATE_MS
+    assert LanguageIdEngine.lid_interval_ms(True, has_candidate=False) == LID_INTERVAL_UNCERTAIN_MS
+    assert LanguageIdEngine.lid_interval_ms(False, has_candidate=False) == LID_INTERVAL_STABLE_MS
+

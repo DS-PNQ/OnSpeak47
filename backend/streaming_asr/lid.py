@@ -2,8 +2,10 @@
 from dataclasses import dataclass, field
 from .config import (
     W_ACOUSTIC, W_TEXT, W_CONFIDENCE, W_HISTORY, EMA_ALPHA,
-    LID_INTERVAL_STABLE_MS, LID_INTERVAL_UNCERTAIN_MS,
+    LID_INTERVAL_STABLE_MS, LID_INTERVAL_UNCERTAIN_MS, LID_INTERVAL_CANDIDATE_MS,
     BOOTSTRAP_W_ACOUSTIC, BOOTSTRAP_W_PRIOR,
+    RUNTIME_W_ACOUSTIC, RUNTIME_W_TEXT, RUNTIME_W_CONFIDENCE, RUNTIME_W_HISTORY,
+    VOXLINGUA_MIN_GLOBAL_SCORE,
 )
 
 LANGS = ("vi", "en", "zh")
@@ -231,8 +233,24 @@ class LanguageIdEngine:
                 pass
         return {l: 1.0 / 3 for l in LANGS}
 
+    def has_real_acoustic(self) -> bool:
+        """True when a real VoxLingua session is ready."""
+        return (self.acoustic_scorer is not None
+                and hasattr(self.acoustic_scorer, "is_ready")
+                and self.acoustic_scorer.is_ready())
+
+    def reset(self) -> None:
+        """Clear smoothed telemetry, history, and acoustic engine state."""
+        self.smoothed = {l: 1.0 / 3 for l in LANGS}
+        self.history = {l: 1.0 / 3 for l in LANGS}
+        if hasattr(self.acoustic_scorer, "reset"):
+            try:
+                self.acoustic_scorer.reset()
+            except Exception:
+                pass
+
     def classify_bootstrap(self, audio) -> LidResult:
-        """Bootstrap classification (fakedemo2 §17): audio PRIMARY.
+        """Bootstrap classification (VoxLingua §10, §14–§15): audio PRIMARY.
 
         bootstrapScore = 0.90 * acoustic + 0.10 * uniform prior. Text,
         history and ASR confidence are disabled; side-effect free (must not
@@ -240,6 +258,26 @@ class LanguageIdEngine:
         """
         if not audio:
             return LidResult("und", 0.0, {l: 1.0 / 3 for l in LANGS})
+
+        # Detailed VoxLingua path (§14): global-top policy first.
+        if hasattr(self.acoustic_scorer, "classify_detailed"):
+            try:
+                detailed = self.acoustic_scorer.classify_detailed(audio)
+                if detailed is not None and getattr(detailed, "num_windows", 0) > 0:
+                    if not detailed.is_supported_top():
+                        return LidResult("und", 0.0, {l: 1.0 / 3 for l in LANGS})
+                    if detailed.global_top_score < VOXLINGUA_MIN_GLOBAL_SCORE:
+                        return LidResult("und", 0.0, {l: 1.0 / 3 for l in LANGS})
+                    fused = _normalize({
+                        "vi": BOOTSTRAP_W_ACOUSTIC * detailed.vi + BOOTSTRAP_W_PRIOR * (1.0 / 3),
+                        "en": BOOTSTRAP_W_ACOUSTIC * detailed.en + BOOTSTRAP_W_PRIOR * (1.0 / 3),
+                        "zh": BOOTSTRAP_W_ACOUSTIC * detailed.zh + BOOTSTRAP_W_PRIOR * (1.0 / 3),
+                    })
+                    best = max(LANGS, key=lambda l: fused[l])
+                    return LidResult(best, fused[best], dict(fused))
+            except Exception:
+                pass
+
         acoustic = self._acoustic_audio_only(audio)
         fused = _normalize({l: BOOTSTRAP_W_ACOUSTIC * acoustic[l]
                             + BOOTSTRAP_W_PRIOR * (1.0 / 3) for l in LANGS})
@@ -249,16 +287,19 @@ class LanguageIdEngine:
     def classify(self, audio, partial_text: str, token_conf: float, active: str) -> LidResult:
         acoustic = self._acoustic(audio, partial_text)
         text_ev = self.text_evidence(partial_text)
+
+        real_acoustic = self.has_real_acoustic()
+        w_a = RUNTIME_W_ACOUSTIC if real_acoustic else W_ACOUSTIC
+        w_t = RUNTIME_W_TEXT if real_acoustic else W_TEXT
+        w_c = RUNTIME_W_CONFIDENCE if real_acoustic else W_CONFIDENCE
+        w_h = RUNTIME_W_HISTORY if real_acoustic else W_HISTORY
+
         combined = {}
         for lang in LANGS:
             conf_w = token_conf if lang == active else (1.0 - token_conf) / 2.0
-            combined[lang] = (W_ACOUSTIC * acoustic[lang] + W_TEXT * text_ev[lang]
-                              + W_CONFIDENCE * conf_w + W_HISTORY * self.history[lang])
+            combined[lang] = (w_a * acoustic[lang] + w_t * text_ev[lang]
+                              + w_c * conf_w + w_h * self.history[lang])
         combined = _normalize(combined)
-        # EMA (spec OPTIONAL 7) smooths only the telemetry view: the router's
-        # hysteresis gate (threshold + margin + 200 ms persistence, spec §12)
-        # already rejects single-window flaps, so gating on the EMA as well
-        # would double-damp and push switch latency into seconds.
         for lang in LANGS:
             prev = self.smoothed[lang]
             self.smoothed[lang] = self.ema_alpha * combined[lang] + (1 - self.ema_alpha) * prev
@@ -273,5 +314,7 @@ class LanguageIdEngine:
         return dict(self.smoothed)
 
     @staticmethod
-    def lid_interval_ms(uncertain: bool) -> int:
+    def lid_interval_ms(uncertain: bool, has_candidate: bool = False) -> int:
+        if has_candidate:
+            return LID_INTERVAL_CANDIDATE_MS
         return LID_INTERVAL_UNCERTAIN_MS if uncertain else LID_INTERVAL_STABLE_MS

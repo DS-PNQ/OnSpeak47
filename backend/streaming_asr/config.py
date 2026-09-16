@@ -10,6 +10,7 @@ CHUNK_SIZE_FALLBACK = 32
 
 LID_INTERVAL_STABLE_MS = 600
 LID_INTERVAL_UNCERTAIN_MS = 400
+LID_INTERVAL_CANDIDATE_MS = 250
 LID_WINDOW_MS = 480
 
 W_ACOUSTIC = 0.45
@@ -17,11 +18,18 @@ W_TEXT = 0.30
 W_CONFIDENCE = 0.15
 W_HISTORY = 0.10
 
-# --- Bootstrap acoustic LID (fakedemo2 §7-§8, §17): audio-only, never the
-# active-ASR transcript. Thresholds are starting points for tuning.
-BOOTSTRAP_MIN_MS = 200
-BOOTSTRAP_LID_WINDOW_MS = 300
-BOOTSTRAP_MAX_MS = 400
+# --- Bootstrap acoustic LID (VoxLingua pipeline §5, §7-§8, §17): audio-only,
+# never the active-ASR transcript. Thresholds are starting points for tuning.
+BOOTSTRAP_MIN_MS = 400
+BOOTSTRAP_LID_WINDOW_MS = 600
+BOOTSTRAP_HOP_MS = 200
+BOOTSTRAP_MAX_MS = 1000
+# Give-up cap: past this much speech without a commit, stop burning
+# speculative-candidate decodes and keep only the hidden provisional stream
+# (mirrors AsrState.BOOTSTRAP_GIVE_UP_MS — avoids CPU decode storms).
+BOOTSTRAP_GIVE_UP_MS = 3000
+# Cooldown between speculative-candidate passes (each pass = ≤2 decodes).
+SPECULATIVE_CANDIDATE_COOLDOWN_MS = 800
 BOOTSTRAP_THRESHOLD = 0.70
 BOOTSTRAP_MARGIN = 0.15
 BOOTSTRAP_W_ACOUSTIC = 0.90
@@ -76,3 +84,9 @@ MODEL_FILES = {
             "zipformer_zh_joiner.int8.onnx", "zipformer_zh_tokens.txt"),
 }
 VAD_MODEL = "silero_vad.onnx"
+
+# --- VoxLingua107 ECAPA acoustic LID (VoxLingua pipeline §11–§13) ---
+VOXLINGUA_MODEL = "voxlingua_lid_ecapa.onnx"
+VOXLINGUA_LABELS_JSON = "voxlingua_lid_labels.json"
+VOXLINGUA_N_MELS = 60
+VOXLINGUA_MIN_GLOBAL_SCORE = 0.25
