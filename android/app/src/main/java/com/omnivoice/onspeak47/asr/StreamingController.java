@@ -75,7 +75,7 @@ public class StreamingController {
             ZipformerModelManager mm = models != null ? models : new ZipformerModelManager(app);
             ownsModels = (models == null);
             pipeline = new StreamingPipeline(app, sharedVad, mm,
-                    StreamingPipeline.defaultLidEngine(), new LanguageRouter());
+                    StreamingPipeline.defaultLidEngine(app), new LanguageRouter());
             if (listener != null) pipeline.addListener(listener);
             pipeline.start();
             live = true;

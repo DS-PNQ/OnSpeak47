@@ -28,12 +28,28 @@ import java.util.Map;
 public interface AcousticLidEngine {
 
     /**
-     * Classify one audio window (typically 200–300 ms @ 16 kHz mono floats).
+     * Classify one audio window (typically 400–600 ms @ 16 kHz mono floats
+     * for VoxLingua; 200–300 ms for the legacy heuristic).
      *
      * @return per-language scores in [0,1]; need not sum to 1 (the caller
      *         normalizes). Must never return null. Must not touch transcripts.
      */
     Map<AsrLanguage, Float> classify(float[] audioWindow);
+
+    /**
+     * Detailed VoxLingua result with the global 107-class winner (§14, §31).
+     * Default returns null (legacy scorers only carry VI/EN/ZH). Engines
+     * backed by VoxLingua107 ECAPA override this; LanguageIdEngine prefers
+     * it when present so unsupported global tops (e.g. Japanese) map to
+     * UNKNOWN instead of forced VI/EN/ZH.
+     */
+    default LanguageScores classifyDetailed(float[] audioWindow) {
+        return null;
+    }
+
+    /** Clear per-utterance temporal smoothing state (no-op by default). */
+    default void reset() {
+    }
 
     // --- Interim heuristic (§33 until the trained tiny model lands) --------
 

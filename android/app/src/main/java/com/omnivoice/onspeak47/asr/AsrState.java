@@ -36,9 +36,14 @@ public final class AsrState {
         return "zipformer2";
     }
 
-    // --- LID scheduling (spec §11) ---
+    // --- LID scheduling (spec §11 + VoxLingua pipeline §22) ---
+    // ECAPA is a referee, not a realtime decoder (ASR still ticks every
+    // 160 ms). Stable → 500–800 ms; uncertain → 300–400 ms; an observed
+    // switch candidate is re-polled every 200–300 ms until it passes or
+    // the hysteresis persistence window expires.
     public static final int LID_INTERVAL_STABLE_MS = 600;
     public static final int LID_INTERVAL_UNCERTAIN_MS = 400;
+    public static final int LID_INTERVAL_CANDIDATE_MS = 250;
     public static final int LID_WINDOW_MS = 480;
 
     // --- Router scoring (spec §12) ---
@@ -47,18 +52,30 @@ public final class AsrState {
     public static final float W_CONFIDENCE = 0.15f;
     public static final float W_HISTORY = 0.10f;
 
-    // --- Bootstrap acoustic LID (fakedemo2 §7-§8, §17) ---
+    // --- Bootstrap acoustic LID (VoxLingua pipeline §5, §7-§8, §17) ---
     // Bootstrap answers "which language does this utterance START with?"
     // from AUDIO only — never from the active-ASR transcript (that path is
     // circular: VI decodes EN/ZH into Vietnamese-like text which then votes
-    // VI again). Thresholds are starting points for on-device tuning, not
-    // absolute optima.
+    // VI again). Baseline engineering windows for the VoxLingua107 ECAPA
+    // classifier (600 ms window / 200 ms hop); 200 ms hard-locks too early
+    // (not enough acoustic evidence). Thresholds are starting points for
+    // on-device tuning, not absolute optima.
     /** Minimum speech audio before the first bootstrap attempt. */
-    public static final int BOOTSTRAP_MIN_MS = 200;
+    public static final int BOOTSTRAP_MIN_MS = 400;
     /** Audio window fed to the acoustic LID classifier. */
-    public static final int BOOTSTRAP_LID_WINDOW_MS = 300;
+    public static final int BOOTSTRAP_LID_WINDOW_MS = 600;
+    /** Rolling hop between bootstrap attempts (temporal smoothing §16). */
+    public static final int BOOTSTRAP_HOP_MS = 200;
     /** Extended window when the first attempt is uncertain (§9 cách 1). */
-    public static final int BOOTSTRAP_MAX_MS = 400;
+    public static final int BOOTSTRAP_MAX_MS = 1000;
+    /** Give-up cap: past this much speech without a commit, stop burning
+     *  speculative-candidate decodes (2 shadow decodes per pass) and keep
+     *  only the hidden provisional stream — avoids a CPU decode storm on
+     *  long UNKNOWN spans (unsupported language / noise). Endpoint recovery
+     *  still gets one final chance. */
+    public static final int BOOTSTRAP_GIVE_UP_MS = 3000;
+    /** Cooldown between speculative-candidate passes (each pass = ≤2 decodes). */
+    public static final int SPECULATIVE_CANDIDATE_COOLDOWN_MS = 800;
     /** top1 must reach this to commit a bootstrap language. */
     public static final float BOOTSTRAP_THRESHOLD = 0.70f;
     /** top1 - top2 must reach this (never force VI on max-probability). */
@@ -67,9 +84,11 @@ public final class AsrState {
     public static final float BOOTSTRAP_W_ACOUSTIC = 0.90f;
     public static final float BOOTSTRAP_W_PRIOR = 0.10f;
 
-    // --- Runtime LID weights (fakedemo2 §18, starting point) ---
-    // Kept separate from W_* above (which the current tuned pipeline + tests
-    // rely on). Retune towards these once the real acoustic scorer lands:
+    // --- Runtime LID weights (VoxLingua pipeline §10, starting point) ---
+    // Kept separate from W_* below (which the current tuned pipeline + tests
+    // rely on for the heuristic fallback). Once the VoxLingua acoustic scorer
+    // is resident, LanguageIdEngine prefers these: acoustic is PRIMARY,
+    // text/ASR-confidence are secondary, history only stabilizes.
     // ASR confidence only says the model trusts its own hypothesis, not that
     // the audio is that language — so its weight stays minimal.
     public static final float RUNTIME_W_ACOUSTIC = 0.65f;
@@ -138,7 +157,7 @@ public final class AsrState {
     public static final int LATENCY_P50_TARGET_MS = 350;
     public static final int LATENCY_P95_TARGET_MS = 500;
 
-    // --- Model asset names (spec §4, §33) ---
+    // --- Model asset names (spec §4, §33 + VoxLingua pipeline §12) ---
     public static final String VI_ENCODER = "zipformer_vi_encoder.onnx";
     public static final String VI_DECODER = "zipformer_vi_decoder.onnx";
     public static final String VI_JOINER = "zipformer_vi_joiner.onnx";
@@ -154,4 +173,18 @@ public final class AsrState {
     public static final String ZH_JOINER = "zipformer_zh_joiner.int8.onnx";
     public static final String ZH_TOKENS = "zipformer_zh_tokens.txt";
     public static final String VAD_MODEL = "silero_vad.onnx";
+
+    // --- VoxLingua107 ECAPA acoustic LID (VoxLingua pipeline §11–§13) ---
+    // Community ONNX export (beginning-ai/...-onnx, ~85 MB on disk,
+    // ~110–150 MB working set). FP32 first: validate accuracy → benchmark
+    // latency/RAM → then try INT8 (VI↔EN confusion is the critical pair).
+    // Frontend: 16 kHz mono, 60-bin FBank (see VoxLinguaFbankExtractor).
+    // Do NOT quantize ECAPA before the FP32 parity check passes.
+    public static final String VOXLINGUA_MODEL = "voxlingua_lid_ecapa.onnx";
+    public static final String VOXLINGUA_LABELS_JSON = "voxlingua_lid_labels.json";
+    public static final int VOXLINGUA_N_MELS = 60;
+    /** Absolute global-top floor: below this the window is too flat to trust
+     *  even when the supported-relative margin passes (107-way uniform ≈
+     *  0.009). Starting point for tuning, not a guarantee. */
+    public static final float VOXLINGUA_MIN_GLOBAL_SCORE = 0.25f;
 }

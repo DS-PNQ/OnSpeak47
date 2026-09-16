@@ -55,7 +55,7 @@ public class LanguageRouter {
     private float activeConfidence = 1.0f / 3;
     private AsrLanguage candidate;
     private long candidateSinceMs = -1;
-    private RouterState state = RouterState.ACTIVE;
+    private RouterState state = RouterState.UNKNOWN;
 
     private final float switchThreshold;
     private final float switchMargin;

@@ -96,6 +96,12 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     private volatile AsrLanguage provisionalLang = AsrLanguage.VI;
     private volatile String provisionalSpeculative = "";
     private volatile float provisionalConf = 0.33f;
+    /** Last provisional text already posted to UI (dedup: the transducer
+     *  re-emits the same hypothesis every 160 ms — re-posting it only
+     *  churns the UI without new information). The decode itself still
+     *  runs (adopt fast-path needs the live stream state); only the UI
+     *  post is gated. */
+    private volatile String lastPostedProvisional = "";
 
     // Debug telemetry: frame/speech/decode counters + last partial snapshot,
     // logged every ~5 s while running (spec §28 troubleshooting).
@@ -127,15 +133,39 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     /** Convenience constructor with default engines. */
     public StreamingPipeline(Context context) {
         this(context, new VadEngine(context), new ZipformerModelManager(context),
-                defaultLidEngine(), new LanguageRouter());
+                defaultLidEngine(context), new LanguageRouter());
     }
 
     /**
-     * Default LID engine wired to the interim audio-derived heuristic (§16).
-     * Replaces the old {@code new LanguageIdEngine()} whose null scorer fell
-     * back to a transcript heuristic — the circular VI lock (§3–§4). Inject a
-     * trained tiny classifier via the 5-arg constructor to upgrade.
+     * Default LID engine: VoxLingua107 ECAPA when its ONNX asset is bundled,
+     * otherwise the interim audio-derived heuristic (§16).
+     *
+     * VoxLingua loads lazily off-thread (~85 MB) and reports flat/uncertain
+     * until ready, so construction never blocks and the pipeline falls
+     * through to extend-window / dual-candidate in the meantime. The old
+     * {@code new LanguageIdEngine()} with a null scorer fell back to a
+     * transcript heuristic — the circular VI lock (§3–§4) — and must not
+     * come back.
      */
+    public static LanguageIdEngine defaultLidEngine(Context context) {
+        LanguageIdEngine lid = new LanguageIdEngine();
+        VoxLinguaAcousticLidEngine vox = null;
+        try {
+            vox = VoxLinguaAcousticLidEngine.createIfAvailable(context);
+        } catch (Exception e) {
+            Log.w(TAG, "voxlingua probe failed, heuristic fallback: " + e.getMessage());
+        }
+        if (vox != null) {
+            lid.setAcousticLidEngine(vox);
+            Log.i(TAG, "LID: VoxLingua107 ECAPA (loading in background)");
+        } else {
+            lid.setAcousticLidEngine(new AcousticLidEngine.HeuristicAcousticLidEngine());
+            Log.i(TAG, "LID: heuristic fallback (voxlingua asset absent)");
+        }
+        return lid;
+    }
+
+    /** Legacy no-context path (unit tests): heuristic fallback. */
     public static LanguageIdEngine defaultLidEngine() {
         LanguageIdEngine lid = new LanguageIdEngine();
         lid.setAcousticLidEngine(new AcousticLidEngine.HeuristicAcousticLidEngine());
@@ -167,6 +197,10 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         activeAsr = null;
         router.reset();
         transcripts.reset();
+        try {
+            lid.reset();
+        } catch (Exception ignored) {
+        }
         schedulerFill = 0;
         utteranceStartMs = -1;
         lastLidMs = 0;
@@ -300,9 +334,12 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         // 160 ms scheduler accumulation on the active stream.
         accumulateScheduler(frame, nowMs, false);
 
-        // Async LID at 400–600 ms cadence (spec §11), never blocking ASR.
+        // Async ECAPA referee (§22), never blocking ASR: stable 600 ms,
+        // uncertain 400 ms, observed candidate 250 ms. ASR still ticks every
+        // 160 ms — LID only votes.
         int lidInterval = LanguageIdEngine.lidIntervalMs(
-                router.state() != RouterState.ACTIVE);
+                router.state() != RouterState.ACTIVE,
+                router.candidate() != null);
         if (nowMs - lastLidMs >= lidInterval) {
             lastLidMs = nowMs;
             final float[] window = ring.lastMs(AsrState.LID_WINDOW_MS);
@@ -364,8 +401,11 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
 
     /**
      * Provisional speculative decode (Option A): continuous partials on the
-     * VI engine while UNKNOWN. Emits immediately for live UI feedback; the
-     * text is held outside the shared transcript manager so a later commit
+     * VI engine while UNKNOWN. The decode MUST keep running (the adopt
+     * fast-path needs the live stream state), but UI posts are hidden
+     * speculative-only (lang=UND, never committed) and de-duplicated:
+     * re-posting the identical hypothesis every 160 ms only flickers the UI.
+     * Text is held outside the shared transcript manager so a later commit
      * to another language discards it without a trace.
      */
     private void decodeProvisional(float[] chunk, long audioTimeMs) {
@@ -397,10 +437,11 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         dbgLastConf = p.confidence;
         provisionalSpeculative = dbgLastPartial;
         provisionalConf = p.confidence;
-        if (!dbgLastPartial.isEmpty()) {
+        if (!dbgLastPartial.isEmpty() && !dbgLastPartial.equals(lastPostedProvisional)) {
+            lastPostedProvisional = dbgLastPartial;
             Log.d(TAG, "provisional lang=" + provisionalLang.code + " conf=" + p.confidence
                     + " text=" + truncate(dbgLastPartial, 80));
-            postPartial("", dbgLastPartial, provisionalLang.code);
+            postPartial("", dbgLastPartial, AsrLanguage.UND.code);
         }
         if (dbgFrames % 100 == 0) logDbg();
     }
@@ -442,11 +483,12 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     private void tryBootstrapLid(long nowMs) {
         if (activeLang != AsrLanguage.UND || bootstrapPending) return;
         if (utteranceSpeechMs < AsrState.BOOTSTRAP_MIN_MS) return;
-        // Extend-window gate (§9 cách 1): retry only as fresh audio arrives,
-        // so a stuck-uncertain utterance doesn't spin the executor.
+        // Rolling hop gate (§5, §16): one attempt per 200 ms of fresh audio
+        // (600 ms window / 200 ms hop → temporal smoother fuses 3 hops).
+        // Past BOOTSTRAP_MAX_MS keep polling at the hop cadence — the
+        // uncertain path below rate-limits the expensive dual-candidate pass.
         if (lastBootstrapSpeechMs >= 0
-                && utteranceSpeechMs - lastBootstrapSpeechMs < AsrState.SCHEDULER_MS
-                && utteranceSpeechMs >= AsrState.BOOTSTRAP_MAX_MS) {
+                && utteranceSpeechMs - lastBootstrapSpeechMs < AsrState.BOOTSTRAP_HOP_MS) {
             return;
         }
         bootstrapPending = true;
@@ -502,9 +544,21 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
                 return;
             }
             // Cooldown: a candidate pass costs 2 shadow decodes — rerun at
-            // most every 800 ms of additional audio, not every LID tick.
+            // most every SPECULATIVE_CANDIDATE_COOLDOWN_MS of additional audio,
+            // not every LID tick.
             long sinceCandidates = speechMsAtRequest - lastCandidateRunSpeechMs;
-            if (lastCandidateRunSpeechMs >= 0 && sinceCandidates < 800) {
+            if (lastCandidateRunSpeechMs >= 0
+                    && sinceCandidates < AsrState.SPECULATIVE_CANDIDATE_COOLDOWN_MS) {
+                bootstrapPending = false;
+                return;
+            }
+            // Give-up: past BOOTSTRAP_GIVE_UP_MS without a commit (unsupported
+            // language / noise), stop burning candidate decodes. The hidden
+            // provisional stream keeps flowing and the endpoint recovery still
+            // gets one final chance — this only stops the CPU decode storm.
+            if (speechMsAtRequest > AsrState.BOOTSTRAP_GIVE_UP_MS) {
+                Log.i(TAG, "bootstrap give-up after " + speechMsAtRequest
+                        + "ms, keeping hidden provisional only");
                 bootstrapPending = false;
                 return;
             }
@@ -560,12 +614,14 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
                     lang.code);
             Log.i(TAG, "bootstrap adopted provisional " + lang.code + " conf=" + confidence);
             provisionalSpeculative = "";
+            lastPostedProvisional = "";
             bootstrapPending = false;
             return;
         }
         // Rollback: provisional text belonged to the wrong language — drop it
         // (it never entered the transcript manager) and rebuild on the winner.
         provisionalSpeculative = "";
+        lastPostedProvisional = "";
         provisionalAsr = null;
         schedulerFill = 0; // replay below re-covers this audio from the ring
         setActiveLanguage(lang, confidence);
@@ -612,6 +668,11 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
             window = ring.lastMs(AsrState.BOOTSTRAP_MAX_MS);
         } catch (Exception e) {
             Log.w(TAG, "speculative candidates: no audio", e);
+            return;
+        }
+        // Too-short window → decode would be garbage + burn 2 engines.
+        if (window == null || window.length < AsrState.SAMPLE_RATE * 400 / 1000) {
+            bootstrapPending = false;
             return;
         }
         runSpeculativeCandidatesOn(r, uid, window, chooseCandidatePair(
@@ -986,18 +1047,10 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
                 }
             }
             if (decided == AsrLanguage.UND) {
-                // Final backstop: full-utterance verification with the
-                // provisional hypothesis as base (old-system behavior).
-                String base = provisionalSpeculative == null
-                        ? "" : provisionalSpeculative.trim();
-                EndpointVerdict verdict = verifyEndpointLanguage(
-                        base, provisionalConf, provisionalLang);
-                if (verdict != null) {
-                    if (verdict.lang != provisionalLang) {
-                        activateBootstrap(verdict.lang, verdict.confidence, uid);
-                    } else {
-                        adoptProvisional(verdict.confidence, uid);
-                    }
+                // Final backstop: only adopt if acoustic LID had decisive confidence
+                // (>= 0.60), never defaulting to VI without evidence.
+                if (r != null && r.language != AsrLanguage.UND && r.confidence >= 0.60f) {
+                    activateBootstrap(r.language, r.confidence, uid);
                     decided = activeLang;
                 }
             }
@@ -1043,6 +1096,7 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         router.commitBootstrap(activeLang, confidence);
         transcripts.updateSpeculative(provisionalSpeculative);
         provisionalSpeculative = "";
+        lastPostedProvisional = "";
         Log.i(TAG, "endpoint adopted provisional " + activeLang.code
                 + " conf=" + confidence);
     }
@@ -1060,6 +1114,12 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         activeAsr = null;
         activeLang = AsrLanguage.UND;
         router.reset();
+        try {
+            // VoxLingua temporal smoother holds the previous utterance's
+            // language — clear it so the next bootstrap starts flat (§16).
+            lid.reset();
+        } catch (Exception ignored) {
+        }
         schedulerFill = 0;
         utteranceStartMs = -1;
         utteranceStartSample = -1;
@@ -1080,6 +1140,7 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     private void resetProvisional() {
         provisionalLang = AsrLanguage.VI;
         provisionalSpeculative = "";
+        lastPostedProvisional = "";
         provisionalConf = 0.33f;
         try {
             provisionalAsr = models.get(AsrLanguage.VI);

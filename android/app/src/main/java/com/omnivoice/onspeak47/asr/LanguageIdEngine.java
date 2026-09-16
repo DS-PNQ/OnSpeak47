@@ -56,12 +56,13 @@ public class LanguageIdEngine {
             "would", "what", "when", "this", "that", "with", "from", "hi"));
 
     private AcousticScorer acousticScorer;
+    private AcousticLidEngine lidEngine;
     private final Map<AsrLanguage, Float> smoothed = new EnumMap<>(AsrLanguage.class);
     private final Map<AsrLanguage, Float> history = new EnumMap<>(AsrLanguage.class);
     private final float emaAlpha;
 
     public LanguageIdEngine() {
-        this(null, AsrState.EMA_ALPHA);
+        this((AcousticScorer) null, AsrState.EMA_ALPHA);
     }
 
     public LanguageIdEngine(AcousticScorer acousticScorer, float emaAlpha) {
@@ -73,13 +74,40 @@ public class LanguageIdEngine {
         }
     }
 
+    /** VoxLingua path (§32): inject the ECAPA engine directly (preferred). */
+    public LanguageIdEngine(AcousticLidEngine engine, float emaAlpha) {
+        this((AcousticScorer) null, emaAlpha);
+        setAcousticLidEngine(engine);
+    }
+
     public void setAcousticScorer(AcousticScorer scorer) {
         this.acousticScorer = scorer;
     }
 
-    /** Inject the bootstrap acoustic LID engine (fakedemo2 §16). */
+    /** Inject the bootstrap acoustic LID engine (VoxLingua §16, §32). */
     public void setAcousticLidEngine(AcousticLidEngine engine) {
+        this.lidEngine = engine;
         this.acousticScorer = engine == null ? null : new AcousticLidEngine.Adapter(engine);
+    }
+
+    /** True when a real VoxLingua session is resident (runtime-weight path). */
+    public synchronized boolean hasRealAcoustic() {
+        return lidEngine instanceof VoxLinguaAcousticLidEngine
+                && ((VoxLinguaAcousticLidEngine) lidEngine).isReady();
+    }
+
+    /** Clear runtime history/EMA + per-utterance smoother state. */
+    public synchronized void reset() {
+        for (AsrLanguage l : new AsrLanguage[]{AsrLanguage.VI, AsrLanguage.EN, AsrLanguage.ZH}) {
+            smoothed.put(l, 1.0f / 3);
+            history.put(l, 1.0f / 3);
+        }
+        if (lidEngine != null) {
+            try {
+                lidEngine.reset();
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     /**
@@ -95,15 +123,25 @@ public class LanguageIdEngine {
         Map<AsrLanguage, Float> acoustic = acousticScores(audioWindow, partialText);
         Map<AsrLanguage, Float> textEv = textEvidence(partialText);
 
+        // VoxLingua pipeline §10/§34: acoustic PRIMARY once the ECAPA model
+        // is resident (0.65/0.20/0.05/0.10); the heuristic fallback keeps the
+        // legacy 0.45/0.30/0.15/0.10 so its weak prosodic bias can never
+        // dominate text+history on its own.
+        final boolean realAcoustic = hasRealAcoustic();
+        final float wA = realAcoustic ? AsrState.RUNTIME_W_ACOUSTIC : AsrState.W_ACOUSTIC;
+        final float wT = realAcoustic ? AsrState.RUNTIME_W_TEXT : AsrState.W_TEXT;
+        final float wC = realAcoustic ? AsrState.RUNTIME_W_CONFIDENCE : AsrState.W_CONFIDENCE;
+        final float wH = realAcoustic ? AsrState.RUNTIME_W_HISTORY : AsrState.W_HISTORY;
+
         Map<AsrLanguage, Float> combined = new EnumMap<>(AsrLanguage.class);
         for (AsrLanguage l : new AsrLanguage[]{AsrLanguage.VI, AsrLanguage.EN, AsrLanguage.ZH}) {
             float a = acoustic.getOrDefault(l, 1.0f / 3);
             float t = textEv.getOrDefault(l, 1.0f / 3);
             float h = history.getOrDefault(l, 1.0f / 3);
-            float s = AsrState.W_ACOUSTIC * a
-                    + AsrState.W_TEXT * t
-                    + AsrState.W_CONFIDENCE * tokenConfWeight(l, active, tokenConf)
-                    + AsrState.W_HISTORY * h;
+            float s = wA * a
+                    + wT * t
+                    + wC * tokenConfWeight(l, active, tokenConf)
+                    + wH * h;
             combined.put(l, s);
         }
         normalize(combined);
@@ -141,12 +179,19 @@ public class LanguageIdEngine {
     }
 
     /**
-     * Bootstrap classification (fakedemo2 §17): audio is PRIMARY, everything
-     * else is disabled. text = ignored (no transcript exists yet and any
-     * partial would come from a wrong-language decoder), history = neutral,
-     * ASR confidence = disabled.
+     * Bootstrap classification (VoxLingua pipeline §10, §14–§15): audio is
+     * PRIMARY (100% acoustic, or 0.90*acoustic + 0.10*prior), everything else
+     * is disabled. text = ignored (no transcript exists yet and any partial
+     * would come from a wrong-language decoder), history = neutral, ASR
+     * confidence = disabled.
      *
      * <pre>bootstrapScore = 0.90 * acoustic + 0.10 * uniform prior</pre>
+     *
+     * VoxLingua path: when the injected engine exposes
+     * {@link AcousticLidEngine#classifyDetailed}, the global 107-class winner
+     * is enforced — an unsupported top (e.g. Japanese) returns UND even when
+     * the supported-relative margin looks confident, and a flat/weak global
+     * top stays UND (extend window / dual-candidate, never forced VI).
      *
      * Deliberately side-effect free: bootstrap must not drift the runtime
      * history/EMA. Returns UND with a flat score map when there is no audio
@@ -159,6 +204,33 @@ public class LanguageIdEngine {
             flat.put(AsrLanguage.EN, 1.0f / 3);
             flat.put(AsrLanguage.ZH, 1.0f / 3);
             return new LidResult(AsrLanguage.UND, 0f, flat);
+        }
+        // Preferred VoxLingua detailed path (§14): global-top policy first.
+        if (lidEngine != null) {
+            try {
+                LanguageScores detailed = lidEngine.classifyDetailed(audioWindow);
+                if (detailed != null && detailed.numWindows > 0) {
+                    if (!detailed.isSupportedTop()) {
+                        return undFlat();
+                    }
+                    if (detailed.globalTopScore
+                            < AsrState.VOXLINGUA_MIN_GLOBAL_SCORE) {
+                        return undFlat();
+                    }
+                    Map<AsrLanguage, Float> fused = new EnumMap<>(AsrLanguage.class);
+                    fused.put(AsrLanguage.VI, AsrState.BOOTSTRAP_W_ACOUSTIC * detailed.vi
+                            + AsrState.BOOTSTRAP_W_PRIOR * (1.0f / 3));
+                    fused.put(AsrLanguage.EN, AsrState.BOOTSTRAP_W_ACOUSTIC * detailed.en
+                            + AsrState.BOOTSTRAP_W_PRIOR * (1.0f / 3));
+                    fused.put(AsrLanguage.ZH, AsrState.BOOTSTRAP_W_ACOUSTIC * detailed.zh
+                            + AsrState.BOOTSTRAP_W_PRIOR * (1.0f / 3));
+                    normalize(fused);
+                    AsrLanguage best = bestOf(fused);
+                    return new LidResult(best, fused.get(best), new EnumMap<>(fused));
+                }
+            } catch (Exception ignored) {
+                // Fall through to the Map path.
+            }
         }
         Map<AsrLanguage, Float> acoustic = acousticScoresAudioOnly(audioWindow);
         Map<AsrLanguage, Float> fused = new EnumMap<>(AsrLanguage.class);
@@ -369,8 +441,38 @@ public class LanguageIdEngine {
         return Math.max(0, Math.min(1, v));
     }
 
+    private static LidResult undFlat() {
+        Map<AsrLanguage, Float> flat = new EnumMap<>(AsrLanguage.class);
+        flat.put(AsrLanguage.VI, 1.0f / 3);
+        flat.put(AsrLanguage.EN, 1.0f / 3);
+        flat.put(AsrLanguage.ZH, 1.0f / 3);
+        return new LidResult(AsrLanguage.UND, 0f, flat);
+    }
+
+    private static AsrLanguage bestOf(Map<AsrLanguage, Float> m) {
+        AsrLanguage best = AsrLanguage.VI;
+        float bestScore = -1;
+        for (Map.Entry<AsrLanguage, Float> e : m.entrySet()) {
+            if (e.getValue() != null && e.getValue() > bestScore) {
+                bestScore = e.getValue();
+                best = e.getKey();
+            }
+        }
+        return best;
+    }
+
     /** Adaptive LID interval (spec OPTIONAL 6). */
     public static int lidIntervalMs(boolean uncertain) {
         return uncertain ? AsrState.LID_INTERVAL_UNCERTAIN_MS : AsrState.LID_INTERVAL_STABLE_MS;
+    }
+
+    /**
+     * Three-level ECAPA cadence (VoxLingua pipeline §22): stable 500–800 ms,
+     * uncertain 300–400 ms, observed switch candidate 200–300 ms. ASR still
+     * ticks every 160 ms — ECAPA is only the referee.
+     */
+    public static int lidIntervalMs(boolean uncertain, boolean hasCandidate) {
+        if (hasCandidate) return AsrState.LID_INTERVAL_CANDIDATE_MS;
+        return lidIntervalMs(uncertain);
     }
 }
