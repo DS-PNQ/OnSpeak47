@@ -24,7 +24,8 @@ Three models, three stages. Source language is auto-detected by the
 streaming router — the UI only selects the translation target.
 
 **ASR is true streaming**: `AudioRecord` 16 kHz → 20 ms frames → ring
-buffer → Silero VAD → 160 ms scheduler → active Zipformer → partial
+buffer → lossless 512-sample VAD FIFO → Silero VAD (sample-clocked
+endpointing) → 160 ms scheduler → active Zipformer → partial
 transcript → async LID (400–600 ms) → router → 640 ms rollback +
 candidate verification on code-switch. P50 target 250–350 ms, P95 <500 ms
 on the Snapdragon target — see `docs/streaming_asr.md`.
@@ -52,7 +53,7 @@ OnSpeak47/
 │   ├── test_02_translation.py # Hy-MT translation scoring
 │   ├── test_04_vizh_corpus.py # Large-corpus VI↔ZH evaluation
 │   ├── test_05_pipeline.py    # Streaming-final → Translation → TTS tests
-│   ├── test_07_streaming_asr.py # Streaming ASR state-machine gate (36 tests)
+│   ├── test_07_streaming_asr.py # Streaming ASR state-machine gate (51 tests)
 │   ├── baselines/             # Recorded regression baseline (auto-created)
 │   ├── output/                # Latest gate/parity results (JSON)
 │   └── data/
@@ -76,15 +77,21 @@ OnSpeak47/
 │   │   │   ├── pipeline/     # Translation (GGUF), HyMtGgufJNI bridge,
 │   │   │   │                 # TTS, PipelineOrchestrator, Tokenizer
 │   │   │   ├── asr/          # Streaming Zipformer (AudioCapture, Pipeline,
-│   │   │   │                 # VAD, LID, Router, Rollback, ModelManager)
+│   │   │   │                 # VAD + VadWindowBuffer framing, LID, Router,
+│   │   │   │                 # Rollback, ModelManager)
 │   │   │   ├── audio/        # AudioPlayer (no recorder — mic via AudioCapture)
 │   │   │   └── util/         # LanguageConfig, OrtSessionConfig, TensorUtils
 │   │   ├── cpp/              # hymt_gguf_jni.cpp + CMakeLists (vendored llama.cpp)
 │   │   └── res/              # Layouts, values, raw language XMLs
+│   ├── app/src/test/java/    # JVM unit tests (40: streaming state machine,
+│   │                         # VAD framing + endpoint)
+│   ├── app/src/androidTest/  # Instrumented EN reset probe (device only)
 │   └── build.gradle
 │
 ├── docs/
 │   ├── architecture.md           # Pipeline architecture overview
+│   ├── streaming_asr.md          # Streaming ASR design + latency targets
+│   ├── voxlingua_lid_diagnosis.md # LID bootstrap diagnosis (v1/v2 field logs)
 │   └── optimization_results.md   # Runtime/RAM + streaming-ASR optimization log
 │
 └── requirements.txt           # Python dependencies
@@ -134,6 +141,20 @@ python -m pytest tests_local/ -v -s
 python -m pytest tests_local/test_07_streaming_asr.py -v
 python -m backend.streaming_asr.bench
 ```
+
+### Android VAD/streaming unit tests (JVM — no device, no model assets)
+```powershell
+cd android
+gradle testDebugUnitTest --offline    # Gradle 9.5 + JDK 17; Android Studio's Gradle pane works too
+```
+
+40 tests, all green: `StreamingAsrUnitTest` (32) plus the VAD suites
+(`VadWindowBufferTest` 3, `VadEndpointTest` 5). The VAD suites read the real
+16 kHz WAV fixture via the `onspeak.testAudio` system property wired in
+`app/build.gradle`, so framing is exercised with actual PCM instead of
+synthetic arrays. The instrumented EN reset probe in `app/src/androidTest/`
+needs a connected device (`gradle connectedDebugAndroidTest`) and stages the
+same fixture as an APK asset.
 
 ## Translation Backend (Hy-MT1.5-1.8B-1.25bit)
 
@@ -247,28 +268,33 @@ adb logcat -s HyMtGgufJNI TranslationModule PipelineOrchestrator StreamingPipeli
 
 ## Known Issues & Limitations (streaming ASR)
 
-Logic gates (`test_07`, 51 tests, bench A–D) green; **on-device VoxLingua LID
-is an incomplete implementation — field validation and threshold tuning are
-still open (see 1–3).**
+Logic gates (`test_07`, 51 tests, bench A–D) green; Android JVM suites 40/40
+green. **On-device state is still not demo-clean**: language routing is no
+longer the blocker (LID commits `en` on English audio), but the transcript
+stays empty, so the 2026-09-17 session produced no usable output — see 3 and
+the 2026-09-17 field log below.
 
-1. **VoxLingua LID bootstrap: incomplete, under field validation (open).**
-    Diagnosed in `docs/voxlingua_lid_diagnosis.md` (v1 + v2 field logs): the
-    fixed 600 ms window sat below the ECAPA evidence point, the 107-class
-    argmax gate rejected every short-window EN/ZH result, and the 0.30
-    candidate bar committed Vietnamese on no evidence. Current state (this
-    tree, NOT yet proven on-device): growing onset-anchored window (1500 ms
-    live cap, 2500 ms at endpoints), two-tier gate — FAST (absolute mass
-    `≥ 0.45`) for clean audio, SLOW (relative `0.70/0.15` + 3-hop unanimity +
-    foreign-argmax guard) for noisy device-mic audio where supported abs sits
-    at ~0.01 with a correct relative ranking. The 2026-09-16 field log showed
-    exactly that regime (`en-rel 0.77–0.87`, `enAbs 0.01–0.02` → UNKNOWN
-    forever under the abs-only bar). Follow-latest smoother,
-    evidence-steered provisional (switch-to-resident / quiet), candidate bar
-    `0.65 + 0.10` with non-VI-first tie-break, and a post-weak-commit
-    acoustic referee round out the pipeline. Remaining: confirm commit
-    latency/accuracy on real VI/EN/ZH speech, then tune
+1. **VoxLingua LID bootstrap: works on-device for `en`, sub-gate tuning
+    open.** Diagnosed in `docs/voxlingua_lid_diagnosis.md` (v1 + v2 field
+    logs): the fixed 600 ms window sat below the ECAPA evidence point, the
+    107-class argmax gate rejected every short-window EN/ZH result, and the
+    0.30 candidate bar committed Vietnamese on no evidence. Current state
+    (this tree): growing onset-anchored window (1500 ms live cap, 2500 ms at
+    endpoints), two-tier gate — FAST (absolute mass `≥ 0.45`) for clean audio,
+    SLOW (relative `0.70/0.15` + 3-hop unanimity + foreign-argmax guard) for
+    noisy device-mic audio where supported abs sits at ~0.01 with a correct
+    relative ranking. The 2026-09-16 field log showed exactly that regime
+    (`en-rel 0.77–0.87`, `enAbs 0.01–0.02` → UNKNOWN forever under the
+    abs-only bar); the 2026-09-17 log shows the gate now **committing**
+    (`en=0.9996 → bootstrap committed en conf=0.9998`). Follow-latest
+    smoother, evidence-steered provisional (switch-to-resident / quiet),
+    candidate bar `0.65 + 0.10` with non-VI-first tie-break, and a
+    post-weak-commit acoustic referee round out the pipeline. Remaining:
+    commit latency/accuracy on real VI/EN/ZH speech still varies by run
+    (same English video produced `en 0.9996`, `en 0.8565`, `en 0.7408` and one
+    leading `vi 0.7308`), so the gate must keep surviving that spread — tune
     (`VOXLINGUA_MIN_SUPPORTED_ABS_SCORE`, `FOREIGN_TOP_REJECT`, windows) on
-    measured device distributions — clean-sample numbers do NOT transfer.
+    measured device distributions; clean-sample numbers do NOT transfer.
 2. **sherpa `GetFrames` race → native crash (fix landed, soak retest
     pending).** Observed once after long use: `features.cc:GetFrames:188 /
     6208 + 45 > 6248` (fatal, uncatchable) → `Channel is unrecoverably
@@ -284,7 +310,19 @@ still open (see 1–3).**
     uncommitted. A 2026-09-16 field session also showed a late false VI
     commit (`adopted provisional vi conf=0.79` on English audio) — single
     windows can flip either way, which is why the slow path requires
-    unanimity instead of just a lower bar.
+    unanimity instead of just a lower bar. The 2026-09-17 log (below) isolates
+    the remaining symptom more precisely: LID now commits `en` correctly
+    (`voxlingua … en=0.9996`, `bootstrap committed en conf=0.9998`) yet every
+    decode of that English video still logs an empty `text=` — so this is a
+    **decode/transcript** problem, not a language-routing one. Beware the log
+    reading: when the transcript is empty, `StreamingPipeline` reuses the
+    previous `conf` value and `reset()` does not zero it either, so a repeated
+    `conf=0.0638` does **not** prove a frozen decoder. A hypothesis that
+    `reset()` leaves the native stream unusable was **not confirmed**: the
+    Python reference (`sherpa_onnx`) produces normal text after
+    `recognizer.reset(stream)`, and the dedicated
+    `StreamingAsrResetInstrumentedTest` (identical PCM before/after reset) has
+    **not been run yet — no device was attached when it was written**.
 4. **Endpoint trade-off (2000 ms silence).** Natural pauses no longer split
    sentences, but hands-free finals arrive ~2 s after speech stops (plus
    translation). Tapping Stop flushes immediately.
@@ -310,6 +348,71 @@ still open (see 1–3).**
 9. **Upstream caveat.** ORT 1.27.0 is reported to miscompute the zipformer2
    int8 encoder on Snapdragon 8 Elite Gen 5 (k2-fsa/sherpa-onnx#3845);
    fixed upstream in 1.28.0, which no sherpa Android release bundles yet.
+10. **VAD framing + endpoint clock (fixed, unit-tested; device retest open).**
+    `VadEngine` used to stretch each 20 ms capture frame (320 samples) onto the
+    512-sample Silero window by nearest-neighbour index scaling, so duplicated
+    and skipped samples reached the model and the model never saw contiguous
+    audio; the helper also dropped any residual samples, so window boundaries
+    could never align with capture boundaries. The energy fallback path (no
+    native session, no injected scorer) still scores each capture frame
+    directly, so asset-less/test behaviour is unchanged. Now `VadWindowBuffer`
+    is a lossless FIFO:
+    only complete, contiguous 512-sample windows are scored, the partial tail
+    waits for the next frame, and `reset()` clears it. Endpoint decisions are
+    counted in **captured samples** rather than `System.currentTimeMillis()`,
+    so a stalled worker thread or a wall-clock jump can no longer finalize an
+    utterance early; `VadEngine.reset()` also clears the leftover FIFO, the
+    last probability and the gate state. Covered by 8 JVM tests
+    (`VadWindowBufferTest` 3, `VadEndpointTest` 5) — 40/40 green. **Not
+    proven on-device:** the endpoint suites inject a deterministic scorer to
+    test framing/timing, so they say nothing about Silero accuracy, and the
+    empty-EN-transcript symptom (3) is untouched by this fix.
+11. **Reading the `audioDBG` heartbeat.** `speechRmsAvg` and `speechMaxVad` are
+    **per-heartbeat** values (`logDbg()` zeroes the running sum and peak every
+    2 s) while `frames`/`speech` are cumulative — so a heartbeat that added no
+    new speech-classified frame prints `speechRmsAvg=0.0000 speechMaxVad=0.0`
+    with `speech` unchanged. That is the VAD gate not re-triggering, not a dead
+    microphone. Likewise `ysProbs n=N min=… max=…` is a per-decode joiner-stat
+    trace, not an error.
+
+### Field-log notes 2026-09-17 (pid 1090, OnePlus/Oppo device, same English test video)
+
+- Startup is unchanged and clean: three Zipformer recognizers load in ~1 s
+  each, HyMT GGUF in 396 ms, MMS-TTS published for vi/en (zh → system TTS),
+  `Ready!` ~4 s after launch.
+- **LID is no longer the blocker.** On the English video the first VoxLingua
+  inference is decisive (`vi=0.0004 en=0.9996`, `enAbs=0.0100`) and the
+  pipeline commits it: `bootstrap committed en conf=0.9999 replayMs=1060`;
+  the 50th inference still reports `en=0.9922`. The language stays `en` for the
+  whole session.
+- **Yet every decode is empty.** After the commit, `decode lang=en
+  conf=0.16350022 text=` repeats ~8×/s for ~20 s with no text at all, while
+  the VAD heartbeat of that window shows real speech
+  (`frames=100 speech=48 decodes=6 vadProb=0.9982 speechRmsAvg=0.0417
+  speechMaxVad=0.9987`). Text only appears at 21:51:09 — and it starts
+  **mid-word**: `NG` → `NGERS` → `NGERS OF`, unchanged for the last 10 s of
+  the session.
+- That fragment is what got translated (`Translation: "NGERS OF." (574 ms)` →
+  TTS → playback at 21:51:24). So the pipeline's plumbing works end to end;
+  the ASR text is the defect.
+- The second run reproduces the failure in a cleaner form: LID commits
+  `en conf=0.7408 replayMs=860`, seven empty decodes, then
+  `endpoint reached, active=en` at 21:51:26.998 — an **empty final**, so
+  neither Translation nor TTS ran (`utterances=1` with no output). The
+  heartbeats afterwards show the expected post-endpoint silence shape:
+  `frames` keeps counting, `speech=106`, `decodes=12` and `conf` frozen.
+- Session-to-session variance is real: an earlier run in the same log booked
+  `bootstrap committed en conf=0.7202 replayMs=2960` and another
+  `en conf=0.8565 replayMs=1060`, and one run's first inference was
+  `vi=0.7308` on the same English audio — the gate's job is now to survive
+  that, not to be bypassed.
+- Reading this log safely: an empty transcript keeps the **previous** `conf`
+  value (`conf=0.0638` repeated for minutes is stale, not a measurement), and
+  `reset()` does not clear it. See Known Issues 3 for why the mid-life-reset
+  hypothesis was not adopted, and 11 for the heartbeat fields.
+- Safe to ignore (same OEM noise as 09-16): `Oplus*`, `HWUI`,
+  `AppOps attributionTag not declared`, `unregisterSystemUIBroadcastReceiver
+  failed`, `predictive settings is disabled`.
 
 ### Field-log notes 2026-09-16 (pid 12666, OnePlus/Oppo device, post-v1 APK)
 

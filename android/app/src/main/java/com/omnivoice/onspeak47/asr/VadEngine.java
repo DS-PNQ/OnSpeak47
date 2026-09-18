@@ -25,7 +25,7 @@ public class VadEngine {
 
     private static final String TAG = "VadEngine";
 
-    /** 20 ms @ 16 kHz = 320 samples; Silero VAD windows used here. */
+    /** 32 ms of contiguous 16 kHz audio per native Silero inference. */
     public static final int WINDOW_SAMPLES = 512;
 
     /** Energy fallback: RMS above this counts as speech (~-40 dBFS). */
@@ -53,6 +53,13 @@ public class VadEngine {
     private boolean inSpeech = false;
     private long silenceSinceMs = -1;
     private float lastProb = 0;
+    private final VadWindowBuffer windows = new VadWindowBuffer(WINDOW_SAMPLES);
+    private final java.util.function.ToDoubleFunction<float[]> testScorer;
+
+    /** Native-window seam: exercises the production framing and endpoint state machine. */
+    VadEngine(java.util.function.ToDoubleFunction<float[]> scorer) {
+        testScorer = scorer;
+    }
 
     // Silero VAD is stateful (h/c); kept across frames when native is active.
     private float[] vadH;
@@ -60,10 +67,12 @@ public class VadEngine {
     private static final int VAD_STATE_DIM = 128;
 
     public VadEngine() {
+        testScorer = null;
         // Energy fallback only (unit-test / no-asset path).
     }
 
     public VadEngine(Context context) {
+        testScorer = null;
         try {
             String path = copyOptional(context, AsrState.VAD_MODEL);
             if (path != null) {
@@ -95,8 +104,26 @@ public class VadEngine {
         return process(frame, System.currentTimeMillis());
     }
 
+    private long processedSamples;
+
     VadResult process(float[] frame, long nowMs) {
-        float prob = useNative ? nativeProb(frame) : energyProb(frame);
+        // Endpoint time follows captured samples, not worker stalls/wall-clock jumps.
+        processedSamples += frame.length;
+        if (!useNative && testScorer == null) {
+            return updateGate(energyProb(frame), processedSamples * 1000 / AsrState.SAMPLE_RATE);
+        }
+        final boolean[] events = new boolean[2];
+        windows.append(frame, (window, endSample) -> {
+            float prob = testScorer == null ? nativeProb(window)
+                    : (float) testScorer.applyAsDouble(window);
+            VadResult result = updateGate(prob, endSample * 1000 / AsrState.SAMPLE_RATE);
+            events[0] |= result.speechStart;
+            events[1] |= result.speechEnd;
+        });
+        return new VadResult(inSpeech, lastProb, events[0], events[1]);
+    }
+
+    private VadResult updateGate(float prob, long nowMs) {
         lastProb = prob;
         boolean speech = prob >= AsrState.VAD_SPEECH_THRESHOLD;
         boolean start = false;
@@ -133,6 +160,9 @@ public class VadEngine {
     public void reset() {
         inSpeech = false;
         silenceSinceMs = -1;
+        lastProb = 0;
+        processedSamples = 0;
+        windows.reset();
         if (vadH != null) java.util.Arrays.fill(vadH, 0);
         if (vadC != null) java.util.Arrays.fill(vadC, 0);
     }
@@ -156,7 +186,7 @@ public class VadEngine {
 
     private float nativeProb(float[] frame) {
         try {
-            float[] window = resampleToWindow(frame);
+            float[] window = frame; // Already framed by the lossless 512-sample FIFO.
             Map<String, OnnxTensor> inputs = new HashMap<>();
             ai.onnxruntime.OrtEnvironment env = ai.onnxruntime.OrtEnvironment.getEnvironment();
             OnnxTensor audio = OnnxTensor.createTensor(env,
@@ -220,16 +250,6 @@ public class VadEngine {
         } catch (Exception ignored) {
             // Export without recurrent outputs — stateless scoring still works.
         }
-    }
-
-    private static float[] resampleToWindow(float[] frame) {
-        if (frame.length == WINDOW_SAMPLES) return frame.clone();
-        float[] out = new float[WINDOW_SAMPLES];
-        for (int i = 0; i < WINDOW_SAMPLES; i++) {
-            int src = (int) ((long) i * frame.length / WINDOW_SAMPLES);
-            out[i] = frame[Math.min(src, frame.length - 1)];
-        }
-        return out;
     }
 
     private static String copyOptional(Context context, String asset) {

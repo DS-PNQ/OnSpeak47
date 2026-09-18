@@ -17,6 +17,7 @@ android {
         targetSdkVersion 34
         versionCode 1
         versionName '1.0.0'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
 
         // Only build for ARM64 (mobile target per pipeline_overview.md)
         ndk {
@@ -80,6 +81,16 @@ android {
         }
     }
 
+
+    sourceSets {
+        androidTest.assets.srcDir '../../tests_local/data/audio_samples'
+    }
+
+    testOptions {
+        unitTests.all {
+            systemProperty 'onspeak.testAudio', rootProject.file('../tests_local/data/audio_samples/parity_en.wav').absolutePath
+        }
+    }
 
     // Allow large ONNX model files in assets
 }
