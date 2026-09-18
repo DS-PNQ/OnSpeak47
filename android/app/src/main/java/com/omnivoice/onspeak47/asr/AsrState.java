@@ -25,14 +25,22 @@ public final class AsrState {
     public static final int CHUNK_SIZE_FALLBACK = 32;
     /**
      * Transducer architecture variant passed as OnlineModelConfig modelType.
-     * All three bundled encoders carry model_type=zipformer2 in their own
-     * metadata (verified via onnxruntime ModelMetadata, including the hynt
-     * VI file) — EN 2023-06-26 and ZH-int8 2025-06-30 match the upstream
-     * Kotlin demo pairings too. Do NOT set "zipformer": the v1 wrapper
-     * requires an attention_dims metadata key these files don't have and
-     * aborts natively at startup (no Java stack).
+     * This is a property of the individual ONNX export, never of the app, so
+     * it must be resolved per language — passing the wrong value aborts
+     * natively during initialization (no Java stack, process death).
+     *
+     * VI — hynt 30M streaming export: metadata carries model_type=zipformer2
+     * AND the query_head_dims keys the v2 wrapper requires → "zipformer2".
+     *
+     * EN/ZH — the shared bilingual export (k2fsa-zipformer-chinese-english-
+     * mixed, csukuangfj): a zipformer **v1** graph with attention_dims but no
+     * query_head_dims, so the v2 wrapper has nothing to bind and dies. Measured
+     * 2026-09-18 with sherpa-onnx Python: model_type="zipformer" decodes it
+     * (parity_en.wav → "I WOULD LIKE TO RING YOU MY CITIZEN IN CARD"),
+     * model_type="zipformer2" → native FATAL. Hence "zipformer" here.
      */
     public static String transducerModelType(AsrLanguage lang) {
+        if (lang == AsrLanguage.EN || lang == AsrLanguage.ZH) return "zipformer";
         return "zipformer2";
     }
 
@@ -207,16 +215,23 @@ public final class AsrState {
     public static final String VI_DECODER = "zipformer_vi_decoder.onnx";
     public static final String VI_JOINER = "zipformer_vi_joiner.onnx";
     public static final String VI_TOKENS = "zipformer_vi_tokens.txt";
-    public static final String EN_ENCODER = "zipformer_en_encoder.onnx";
-    public static final String EN_DECODER = "zipformer_en_decoder.onnx";
-    public static final String EN_JOINER = "zipformer_en_joiner.onnx";
-    public static final String EN_TOKENS = "zipformer_en_tokens.txt";
-    public static final String ZH_ENCODER = "zipformer_zh_encoder.int8.onnx";
-    // NOTE: upstream's ZH int8 package ships an fp32 decoder (no int8
-    // decoder published) — the asset name reflects the real file.
-    public static final String ZH_DECODER = "zipformer_zh_decoder.onnx";
-    public static final String ZH_JOINER = "zipformer_zh_joiner.int8.onnx";
-    public static final String ZH_TOKENS = "zipformer_zh_tokens.txt";
+    /**
+     * EN + ZH share ONE bilingual model: k2fsa-zipformer-chinese-english-mixed
+     * (csukuangfj). It replaces the previous separate EN (2023-06-26, 70 MB)
+     * and ZH (int8 2025-06-30, 161 MB) exports: one 80 MB encoder covers both
+     * languages instead of two sessions and 231 MB of assets, and code-switched
+     * speech no longer needs a model switch. Both language SLOTS still exist in
+     * the router, so each keeps its own native session/stream state; they just
+     * load the same files. `model_type` for these assets is "zipformer" (v1) —
+     * see transducerModelType().
+     *
+     * The int8 encoder/joiner + fp32 decoder split mirrors the upstream export
+     * (no int8 decoder is published) — the asset names reflect the real files.
+     */
+    public static final String MIXED_ENCODER = "zipformer_mixed_encoder.int8.onnx";
+    public static final String MIXED_DECODER = "zipformer_mixed_decoder.onnx";
+    public static final String MIXED_JOINER = "zipformer_mixed_joiner.int8.onnx";
+    public static final String MIXED_TOKENS = "zipformer_mixed_tokens.txt";
     public static final String VAD_MODEL = "silero_vad.onnx";
 
     // --- VoxLingua107 ECAPA acoustic LID (VoxLingua pipeline §11–§13) ---

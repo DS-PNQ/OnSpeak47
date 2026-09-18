@@ -221,8 +221,12 @@ Required assets:
   https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar)
 - `Hy-MT1.5-1.8B-1.25bit.gguf` (translation, post-typefix revision)
 - `zipformer_vi_encoder.onnx` / `zipformer_vi_decoder.onnx` / `zipformer_vi_joiner.onnx` / `zipformer_vi_tokens.txt`
-- `zipformer_en_encoder.onnx` / `zipformer_en_decoder.onnx` / `zipformer_en_joiner.onnx` / `zipformer_en_tokens.txt`
-- `zipformer_zh_encoder.int8.onnx` / `zipformer_zh_decoder.onnx` / `zipformer_zh_joiner.int8.onnx` / `zipformer_zh_tokens.txt`
+- `zipformer_mixed_encoder.int8.onnx` / `zipformer_mixed_decoder.onnx` / `zipformer_mixed_joiner.int8.onnx` / `zipformer_mixed_tokens.txt`
+  — **one bilingual EN+ZH model** (`k2fsa-zipformer-chinese-english-mixed`,
+  csukuangfj on HuggingFace) shared by both language slots. Replaced the
+  separate EN 2023-06-26 (70 MB) and ZH int8 2025-06-30 (161 MB) packages: one
+  80 MB encoder instead of two sessions and 231 MB of assets, and
+  code-switched speech no longer needs a model switch.
 - `silero_vad.onnx` (VAD; missing → energy-gate fallback)
 - `mms_tts_vi.onnx` + `mms_tts_vi_vocab.json` (MMS-TTS Vietnamese)
 - `mms_tts_en.onnx` + `mms_tts_en_config.json` + `mms_tts_en_vocab.json` (MMS-TTS English)
@@ -333,11 +337,15 @@ the 2026-09-17 field log below.
    (`cannot locate symbol OrtGetApiBase`). Related rule: never decode
    without `isReadyToDecode()` — sherpa aborts the whole process on an
    under-buffered decode (no exception is thrown).
-6. **Memory & startup.** Full stack (VI+EN+ZH + HyMT + TTS) measures
-   ~1.35 GB PSS, stable across sessions (no leak observed); the 6 GB / 4 GB
-   lazy buckets are designed but less validated on-device. Cold start loads
-   the three Zipformer recognizers sequentially (~2.6 s VI→EN→ZH on-device),
-   covered by the `LoadingActivity` screen.
+6. **Memory & startup.** The ~1.35 GB PSS figure was measured with the old
+   separate EN (70 MB) + ZH (161 MB) encoders; the 2026-09-18 swap replaces
+   both with **one** 80 MB int8 bilingual encoder — the EN and ZH slots each
+   open their own session over the same file, so two sessions read one asset.
+   That changes both the asset footprint (~231 MB → ~80 MB) and the PSS
+   baseline, and the new numbers have **not** been re-measured on-device yet.
+   Cold start still loads the three Zipformer recognizers sequentially
+   (~2.6 s VI→EN→ZH with the old pair), covered by the `LoadingActivity`
+   screen.
 7. **Metrics caveat.** `utterances` counts VAD endpoints *including* empty
    UND finals, so it overstates successfully decoded utterances; pair it
    with non-empty FINAL logs when measuring. `partial_p50 ≈ 160 ms`

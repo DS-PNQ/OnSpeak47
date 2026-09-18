@@ -151,10 +151,16 @@ python optimize/11_fetch_streaming_zipformer.py --all --stage-assets
 
 | Lang | Asset set | Notes |
 |---|---|---|
-| VI | `hynt/Zipformer-30M-RNNT-Streaming-6000h` (HF) → `zipformer_vi_*` | streaming 30M, chunk 16/32/64 |
-| EN | `sherpa-onnx-streaming-zipformer-en-2023-06-26` (release tarball) | INT8, ~70 MB |
-| ZH | `sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30` (release tarball) | INT8, ~160 MB; never xlarge on mobile |
+| VI | `hynt/Zipformer-30M-RNNT-Streaming-6000h` (HF) → `zipformer_vi_*` | streaming 30M, chunk 16/32/64; `model_type=zipformer2` |
+| EN + ZH | `csukuangfj/k2fsa-zipformer-chinese-english-mixed` (HF) → `zipformer_mixed_*` | **one bilingual model for both slots**; INT8 encoder ~80 MB (fp32 decoder), `model_type=zipformer` (v1) — see below |
 | VAD | `silero_vad.onnx` (release asset) | missing → energy-gate fallback |
+
+`model_type` is **per asset set, never global** (`AsrState.transducerModelType`):
+the VI export is zipformer v2 (`query_head_dims` present) while the mixed export
+is zipformer v1 (`attention_dims` only). Decoding the mixed model with
+`"zipformer2"` **aborts the process natively** — there is no Java exception to
+catch (verified 2026-09-18 with sherpa-onnx Python from a clean process).
+The EN and ZH router slots stay separate; they just resolve to the same files.
 
 RAM buckets (§5): ≥8 GB preload VI+EN+ZH; 6 GB VI+EN (+ZH lazy);
 ≤4 GB VI (+EN/ZH lazy). One active decoder; candidate only in the rollback

@@ -6,14 +6,15 @@ Spec §4 + §33. Downloads (gitignored) model files into
 ``android/app/src/main/assets/``.
 
 Sources (re-check at implementation time — upstream repacks happen):
-  EN : sherpa-onnx-streaming-zipformer-en-2023-06-26   (tar.bz2 release)
-  ZH : sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30 (tar.bz2 release)
+  EN+ZH: csukuangfj/k2fsa-zipformer-chinese-english-mixed (HuggingFace) — ONE
+         bilingual model for both language slots (was: separate EN 2023-06-26
+         and ZH int8 2025-06-30 tarball releases)
   VI : hynt/Zipformer-30M-RNNT-Streaming-6000h (HuggingFace, streaming)
   VAD: silero_vad.onnx (sherpa-onnx release asset)
 
 Usage:
     python optimize/11_fetch_streaming_zipformer.py --list
-    python optimize/11_fetch_streaming_zipformer.py --lang en --stage-assets
+    python optimize/11_fetch_streaming_zipformer.py --lang mixed --stage-assets
     python optimize/11_fetch_streaming_zipformer.py --all
 """
 from __future__ import annotations
@@ -22,8 +23,6 @@ import argparse
 import hashlib
 import shutil
 import sys
-import tarfile
-import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -33,29 +32,16 @@ ASSETS_DIR = ROOT / "android" / "app" / "src" / "main" / "assets"
 
 SHERPA_RELEASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
 
-# Member names verified against the upstream model pages
-# (k2-fsa.github.io/sherpa/onnx/pretrained_models/online-transducer/).
-# EN ships fp32+int8 side by side — we take int8 (spec §33 CPU baseline).
-# ZH int8 package has an fp32 decoder (no int8 decoder published).
-TARBALL_MODELS = {
-    "en": (
-        f"{SHERPA_RELEASE}/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
-        {
-            "zipformer_en_encoder.onnx": "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
-            "zipformer_en_decoder.onnx": "decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
-            "zipformer_en_joiner.onnx": "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
-            "zipformer_en_tokens.txt": "tokens.txt",
-        },
-    ),
-    "zh": (
-        f"{SHERPA_RELEASE}/sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30.tar.bz2",
-        {
-            "zipformer_zh_encoder.int8.onnx": "encoder.int8.onnx",
-            "zipformer_zh_decoder.onnx": "decoder.onnx",
-            "zipformer_zh_joiner.int8.onnx": "joiner.int8.onnx",
-            "zipformer_zh_tokens.txt": "tokens.txt",
-        },
-    ),
+# EN + ZH are served by ONE bilingual model. Member names verified against
+# the upstream repo (huggingface.co/csukuangfj/k2fsa-zipformer-chinese-english-mixed).
+# The export ships int8 encoder/joiner + fp32 decoder (no int8 decoder is
+# published), so the local asset names keep the real precision suffix.
+MIXED_HF_REPO = "csukuangfj/k2fsa-zipformer-chinese-english-mixed"
+MIXED_MEMBERS = {
+    "zipformer_mixed_encoder.int8.onnx": "exp/encoder-epoch-99-avg-1.int8.onnx",
+    "zipformer_mixed_decoder.onnx": "exp/decoder-epoch-99-avg-1.onnx",
+    "zipformer_mixed_joiner.int8.onnx": "exp/joiner-epoch-99-avg-1.int8.onnx",
+    "zipformer_mixed_tokens.txt": "data/lang_char_bpe/tokens.txt",
 }
 
 # VI chunk preference: chunk-16 is the latency baseline (spec §9/§20);
@@ -91,29 +77,37 @@ def _have_all(names: list[str]) -> bool:
     return all((OUT_DIR / n).exists() and (OUT_DIR / n).stat().st_size > 0 for n in names)
 
 
-def fetch_tarball(lang: str) -> list[Path]:
-    url, members = TARBALL_MODELS[lang]
+def fetch_mixed() -> list[Path]:
+    """Fetch the shared EN+ZH bilingual model from HuggingFace."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    if _have_all(list(members)):
-        print(f"[skip] {lang}: all {len(members)} assets already present")
-        return [OUT_DIR / n for n in members]
-    with tempfile.TemporaryDirectory() as tmp:
-        archive = Path(tmp) / url.rsplit("/", 1)[-1]
-        _download(url, archive)
-        got = []
-        with tarfile.open(archive, "r:*") as tar:
-            names = tar.getnames()
-            for asset_name, suffix in members.items():
-                match = next((n for n in names if n.endswith(suffix)), None)
-                if match is None:
-                    print(f"[warn] {suffix} not found in {archive.name}; skipping {asset_name}",
-                          file=sys.stderr)
-                    continue
-                member = tar.getmember(match)
-                member.name = asset_name  # flatten: avoid nested dirs
-                tar.extract(member, OUT_DIR)
-                got.append(OUT_DIR / asset_name)
-        return got
+    if _have_all(list(MIXED_MEMBERS)):
+        print(f"[skip] mixed: all {len(MIXED_MEMBERS)} assets already present")
+        return [OUT_DIR / n for n in MIXED_MEMBERS]
+    try:
+        from huggingface_hub import hf_hub_download  # type: ignore
+    except ImportError:
+        print("[error] huggingface_hub is required for the EN/ZH mixed model:\n"
+              "        pip install huggingface_hub\n"
+              f"        repo: {MIXED_HF_REPO}", file=sys.stderr)
+        return []
+    got = []
+    for asset_name, repo_path in MIXED_MEMBERS.items():
+        dest = OUT_DIR / asset_name
+        if dest.exists() and dest.stat().st_size > 0:
+            print(f"[skip] mixed: {asset_name} already present")
+            got.append(dest)
+            continue
+        try:
+            src = Path(hf_hub_download(repo_id=MIXED_HF_REPO, filename=repo_path))
+        except Exception as exc:  # network / 404 / gated repo
+            print(f"[warn] {repo_path} not fetched ({exc}); skipping {asset_name}",
+                  file=sys.stderr)
+            continue
+        shutil.copy2(src, dest)
+        print(f"[pick] {asset_name} <- {repo_path} "
+              f"({dest.stat().st_size / 1e6:.1f} MB)")
+        got.append(dest)
+    return got
 
 
 def fetch_vi() -> list[Path]:
@@ -224,34 +218,40 @@ def stage_to_assets(files: list[Path]) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--lang", choices=["vi", "en", "zh", "vad"], help="fetch one asset set")
-    ap.add_argument("--all", action="store_true", help="fetch vi+en+zh+vad")
+    ap.add_argument("--lang", choices=["vi", "en", "zh", "mixed", "vad"],
+                    help="fetch one asset set (en/zh both map to the mixed model)")
+    ap.add_argument("--all", action="store_true", help="fetch vi+mixed+vad")
     ap.add_argument("--list", action="store_true", help="print expected asset names")
     ap.add_argument("--stage-assets", action="store_true", help="copy into android assets/")
     args = ap.parse_args()
 
     if args.list:
-        print("EN:", list(TARBALL_MODELS["en"][1]))
-        print("ZH:", list(TARBALL_MODELS["zh"][1]))
+        print("EN+ZH (shared mixed model, "
+              f"{MIXED_HF_REPO}):", list(MIXED_MEMBERS))
         print("VI: zipformer_vi_{encoder,decoder,joiner}.onnx + zipformer_vi_tokens.txt"
               f"  (from {VI_HF_REPO})")
         print("VAD: silero_vad.onnx")
         return 0
 
-    targets = ["vi", "en", "zh", "vad"] if (args.all or args.lang is None) else [args.lang]
-    if not args.all and args.lang is None and not args.list:
-        print("[info] no target given — fetching all (vi+en+zh+vad)")
-    if not targets:
-        ap.print_help()
-        return 1
+    if args.all or args.lang is None:
+        targets = ["vi", "mixed", "vad"]
+        print("[info] fetching vi + mixed (EN/ZH) + vad")
+    else:
+        targets = [args.lang]
     fetched: list[Path] = []
+    mixed_done = False
     for t in targets:
         if t == "vi":
             fetched.extend(fetch_vi())
         elif t == "vad":
             fetched.append(fetch_vad())
         else:
-            fetched.extend(fetch_tarball(t))
+            # en / zh / mixed are all the same bilingual export — fetch once.
+            if mixed_done:
+                print(f"[skip] {t}: same files as 'mixed'")
+                continue
+            fetched.extend(fetch_mixed())
+            mixed_done = True
     print(f"[done] {len(fetched)} files in {OUT_DIR}")
     if args.stage_assets:
         stage_to_assets(fetched)

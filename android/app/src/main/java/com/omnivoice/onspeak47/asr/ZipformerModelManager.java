@@ -157,12 +157,11 @@ public class ZipformerModelManager {
                         AsrState.VI_JOINER, AsrState.VI_TOKENS);
                 break;
             case EN:
-                a = resolve(lang, AsrState.EN_ENCODER, AsrState.EN_DECODER,
-                        AsrState.EN_JOINER, AsrState.EN_TOKENS);
-                break;
             case ZH:
-                a = resolve(lang, AsrState.ZH_ENCODER, AsrState.ZH_DECODER,
-                        AsrState.ZH_JOINER, AsrState.ZH_TOKENS);
+                // EN and ZH share one bilingual model; each keeps its own
+                // engine slot so router state stays per-language.
+                a = resolve(lang, AsrState.MIXED_ENCODER, AsrState.MIXED_DECODER,
+                        AsrState.MIXED_JOINER, AsrState.MIXED_TOKENS);
                 break;
             default:
                 a = new Assets(lang, null, null, null, null);

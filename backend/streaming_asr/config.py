@@ -104,14 +104,23 @@ ENDPOINT_VERIFY_MIN_TOKENS = 2
 LATENCY_P50_TARGET_MS = 350
 LATENCY_P95_TARGET_MS = 500
 
+# EN + ZH share ONE bilingual export: k2fsa-zipformer-chinese-english-mixed
+# (csukuangfj) — replaces the separate EN 2023-06-26 and ZH int8 2025-06-30
+# packages. Both language slots still exist in the router; they just load the
+# same files (mirrors AsrState.MIXED_*).
+MIXED_FILES = ("zipformer_mixed_encoder.int8.onnx", "zipformer_mixed_decoder.onnx",
+               "zipformer_mixed_joiner.int8.onnx", "zipformer_mixed_tokens.txt")
 MODEL_FILES = {
     "vi": ("zipformer_vi_encoder.onnx", "zipformer_vi_decoder.onnx",
             "zipformer_vi_joiner.onnx", "zipformer_vi_tokens.txt"),
-    "en": ("zipformer_en_encoder.onnx", "zipformer_en_decoder.onnx",
-            "zipformer_en_joiner.onnx", "zipformer_en_tokens.txt"),
-    "zh": ("zipformer_zh_encoder.int8.onnx", "zipformer_zh_decoder.onnx",
-            "zipformer_zh_joiner.int8.onnx", "zipformer_zh_tokens.txt"),
+    "en": MIXED_FILES,
+    "zh": MIXED_FILES,
 }
+# Transducer variant per language, mirrors AsrState.transducerModelType(): the
+# VI export is model_type=zipformer2 (query_head_dims present), the mixed
+# export is zipformer v1 (attention_dims only) — passing the wrong value aborts
+# natively, so it is per-asset, never a global constant.
+MODEL_TYPE = {"vi": "zipformer2", "en": "zipformer", "zh": "zipformer"}
 VAD_MODEL = "silero_vad.onnx"
 
 # --- VoxLingua107 ECAPA acoustic LID (VoxLingua pipeline §11–§13) ---
