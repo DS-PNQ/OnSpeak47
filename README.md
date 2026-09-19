@@ -221,12 +221,14 @@ Required assets:
   https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar)
 - `Hy-MT1.5-1.8B-1.25bit.gguf` (translation, post-typefix revision)
 - `zipformer_vi_encoder.onnx` / `zipformer_vi_decoder.onnx` / `zipformer_vi_joiner.onnx` / `zipformer_vi_tokens.txt`
-- `zipformer_mixed_encoder.int8.onnx` / `zipformer_mixed_decoder.onnx` / `zipformer_mixed_joiner.int8.onnx` / `zipformer_mixed_tokens.txt`
+- `zipformer_en_zh_mixed_encoder.int8.onnx` / `zipformer_en_zh_mixed_decoder.onnx` / `zipformer_en_zh_mixed_joiner.int8.onnx` / `zipformer_en_zh_mixed_tokens.txt`
   — **one bilingual EN+ZH model** (`k2fsa-zipformer-chinese-english-mixed`,
-  csukuangfj on HuggingFace) shared by both language slots. Replaced the
-  separate EN 2023-06-26 (70 MB) and ZH int8 2025-06-30 (161 MB) packages: one
-  80 MB encoder instead of two sessions and 231 MB of assets, and
-  code-switched speech no longer needs a model switch.
+  csukuangfj on HuggingFace), loaded as **one session** and keyed by
+  `AsrModelType.EN_ZH`, so a LID flip between en and zh neither loads a model
+  nor restarts a stream. Replaced the separate EN 2023-06-26 (70 MB) and ZH
+  int8 2025-06-30 (161 MB) packages: one 80 MB encoder instead of two sessions
+  and 231 MB of assets, and code-switched speech no longer needs a model
+  switch (the shared BPE vocabulary handles it inside the model).
 - `silero_vad.onnx` (VAD; missing → energy-gate fallback)
 - `mms_tts_vi.onnx` + `mms_tts_vi_vocab.json` (MMS-TTS Vietnamese)
 - `mms_tts_en.onnx` + `mms_tts_en_config.json` + `mms_tts_en_vocab.json` (MMS-TTS English)
@@ -262,6 +264,10 @@ adb logcat -s HyMtGgufJNI TranslationModule PipelineOrchestrator StreamingPipeli
   encoder graphs, no SentencePiece BPE, no beam search)
 - **True streaming ASR** — Zipformer transducer with incremental state,
   160 ms scheduler, async LID + router + 640 ms rollback (no WAV staging)
+- **Two ASR models, not three** — `AsrModelType{VI, EN_ZH}`: the bilingual
+  EN+ZH encoder serves both labels from **one** session, and the router only
+  guards VI ↔ EN_ZH, so code-switched speech (`en`↔`zh` inside one utterance)
+  triggers no rollback and no model switch
 - **sherpa-onnx** for streaming ASR; **ONNX Runtime** for VAD/TTS;
   **llama.cpp** for translation
 - **Streaming toggle input** — mic stays open while live; VAD endpoints
@@ -272,8 +278,9 @@ adb logcat -s HyMtGgufJNI TranslationModule PipelineOrchestrator StreamingPipeli
 
 ## Known Issues & Limitations (streaming ASR)
 
-Logic gates (`test_07`, 51 tests, bench A–D) green; Android JVM suites 40/40
-green. **On-device state is still not demo-clean**: language routing is no
+Logic gates (`test_07`, 51 tests, bench A–D) green; Android JVM suites 51/51
+green (including 11 tests pinning the `AsrModelType` bucket behaviour).
+**On-device state is still not demo-clean**: language routing is no
 longer the blocker (LID commits `en` on English audio), but the transcript
 stays empty, so the 2026-09-17 session produced no usable output — see 3 and
 the 2026-09-17 field log below.
@@ -338,14 +345,14 @@ the 2026-09-17 field log below.
    without `isReadyToDecode()` — sherpa aborts the whole process on an
    under-buffered decode (no exception is thrown).
 6. **Memory & startup.** The ~1.35 GB PSS figure was measured with the old
-   separate EN (70 MB) + ZH (161 MB) encoders; the 2026-09-18 swap replaces
-   both with **one** 80 MB int8 bilingual encoder — the EN and ZH slots each
-   open their own session over the same file, so two sessions read one asset.
-   That changes both the asset footprint (~231 MB → ~80 MB) and the PSS
-   baseline, and the new numbers have **not** been re-measured on-device yet.
-   Cold start still loads the three Zipformer recognizers sequentially
-   (~2.6 s VI→EN→ZH with the old pair), covered by the `LoadingActivity`
-   screen.
+   separate EN (70 MB) + ZH (161 MB) encoders, each in its own session. The
+   swap replaces both with **one** 80 MB int8 bilingual encoder, and the model
+   pool is now keyed by `AsrModelType` (`VI`, `EN_ZH`) instead of by language —
+   so EN and ZH share **one** session instead of allocating two over the same
+   file. Assets ~231 MB → ~80 MB; resident sessions 3 → 2; EN↔ZH label flips
+   no longer restart a stream. The new PSS baseline has **not** been
+   re-measured on-device yet. Cold start loads two recognizers (VI + the shared
+   mixed model), covered by the `LoadingActivity` screen.
 7. **Metrics caveat.** `utterances` counts VAD endpoints *including* empty
    UND finals, so it overstates successfully decoded utterances; pair it
    with non-empty FINAL logs when measuring. `partial_p50 ≈ 160 ms`

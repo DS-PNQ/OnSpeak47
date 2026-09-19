@@ -38,10 +38,10 @@ SHERPA_RELEASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-mo
 # published), so the local asset names keep the real precision suffix.
 MIXED_HF_REPO = "csukuangfj/k2fsa-zipformer-chinese-english-mixed"
 MIXED_MEMBERS = {
-    "zipformer_mixed_encoder.int8.onnx": "exp/encoder-epoch-99-avg-1.int8.onnx",
-    "zipformer_mixed_decoder.onnx": "exp/decoder-epoch-99-avg-1.onnx",
-    "zipformer_mixed_joiner.int8.onnx": "exp/joiner-epoch-99-avg-1.int8.onnx",
-    "zipformer_mixed_tokens.txt": "data/lang_char_bpe/tokens.txt",
+    "zipformer_en_zh_mixed_encoder.int8.onnx": "exp/encoder-epoch-99-avg-1.int8.onnx",
+    "zipformer_en_zh_mixed_decoder.onnx": "exp/decoder-epoch-99-avg-1.onnx",
+    "zipformer_en_zh_mixed_joiner.int8.onnx": "exp/joiner-epoch-99-avg-1.int8.onnx",
+    "zipformer_en_zh_mixed_tokens.txt": "data/lang_char_bpe/tokens.txt",
 }
 
 # VI chunk preference: chunk-16 is the latency baseline (spec §9/§20);

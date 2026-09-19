@@ -2,9 +2,15 @@
  * OmniVoice — Zipformer model lifecycle (preload / lazy-load per RAM bucket).
  *
  * Spec §5 + §21 MUST 7: persistent model instances, never load/unload per
- * language switch. Buckets: >=8 GB → VI+EN+ZH resident; 6 GB → VI+EN
- * resident + ZH lazy/mmap; 4 GB → VI resident, EN/ZH lazy. Under memory
- * pressure only active + candidate stay resident.
+ * language switch.
+ *
+ * Mixed EN/ZH plan §5.1: the pool holds TWO native sessions, keyed by
+ * {@link AsrModelType} — VI and the shared EN/ZH bilingual model. EN and ZH
+ * used to be separate slots that loaded the SAME files into two separate
+ * recognizers, so "VI+EN+ZH resident" actually allocated three sessions to
+ * cover two models. Buckets: >=6 GB → VI + EN_ZH resident; below → VI
+ * resident, EN_ZH lazy. Under memory pressure only the active + candidate
+ * buckets stay resident.
  */
 package com.omnivoice.onspeak47.asr;
 
@@ -61,9 +67,9 @@ public class ZipformerModelManager {
 
     private final Context appContext;
     private final StreamingAsrEngine.Factory factory;
-    private final Map<AsrLanguage, StreamingAsrEngine> resident =
-            new EnumMap<>(AsrLanguage.class);
-    private final Map<AsrLanguage, Assets> assets = new EnumMap<>(AsrLanguage.class);
+    private final Map<AsrModelType, StreamingAsrEngine> resident =
+            new EnumMap<>(AsrModelType.class);
+    private final Map<AsrModelType, Assets> assets = new EnumMap<>(AsrModelType.class);
 
     public ZipformerModelManager(Context context) {
         this(context, null);
@@ -71,52 +77,74 @@ public class ZipformerModelManager {
 
     public ZipformerModelManager(Context context, StreamingAsrEngine.Factory factory) {
         this.appContext = context.getApplicationContext();
+        // The factory still speaks AsrLanguage (engine construction needs a
+        // concrete language for FakeEngine/logs); the bucket decides identity.
         this.factory = factory != null ? factory
-                : lang -> StreamingAsrEngine.create(appContext, lang, assetsFor(lang));
+                : lang -> StreamingAsrEngine.create(appContext, lang,
+                        assetsFor(AsrModelType.of(lang)));
     }
 
-    /** Preload per the device RAM bucket (spec §5). */
+    /** Preload per the device RAM bucket (spec §5, mixed EN/ZH plan §5.1). */
     public synchronized void preloadForDevice() {
         long totalMem = totalMemBytes();
-        if (totalMem >= 8L * 1024 * 1024 * 1024) {
-            ensure(AsrLanguage.VI);
-            ensure(AsrLanguage.EN);
-            ensure(AsrLanguage.ZH);
-            Log.i(TAG, ">=8GB: VI+EN+ZH resident");
-        } else if (totalMem >= 6L * 1024 * 1024 * 1024) {
-            ensure(AsrLanguage.VI);
-            ensure(AsrLanguage.EN);
-            Log.i(TAG, "6GB: VI+EN resident, ZH lazy");
+        // Two models, not three: EN and ZH share the bilingual encoder, so
+        // 6 GB devices can now keep BOTH buckets resident (the old bucket
+        // table kept EN resident and left ZH lazy only because ZH was a
+        // second 161 MB session over different files).
+        if (totalMem >= 6L * 1024 * 1024 * 1024) {
+            ensure(AsrModelType.VI);
+            ensure(AsrModelType.EN_ZH);
+            Log.i(TAG, ">=6GB: VI + EN_ZH (shared bilingual) resident");
         } else {
-            ensure(AsrLanguage.VI);
-            Log.i(TAG, "<6GB: VI resident, EN/ZH lazy");
+            ensure(AsrModelType.VI);
+            Log.i(TAG, "<6GB: VI resident, EN_ZH lazy");
         }
     }
 
-    /** Get (creating + caching on first use) the engine for a language. */
+    /**
+     * Get (creating + caching on first use) the engine for a language. EN and
+     * ZH resolve to the SAME engine instance (one bilingual model).
+     */
     public synchronized StreamingAsrEngine get(AsrLanguage lang) {
         // §13: UND is "no language yet", never a model slot. Fail fast so a
         // caller bug can't silently decode on a null-asset engine.
         if (lang == null || lang == AsrLanguage.UND) {
             throw new IllegalArgumentException("no engine for UND (bootstrap first)");
         }
-        return ensure(lang);
+        return ensure(AsrModelType.of(lang));
+    }
+
+    /** Get the engine for a model bucket (VI / EN_ZH). */
+    public synchronized StreamingAsrEngine get(AsrModelType type) {
+        if (type == null || type == AsrModelType.UND) {
+            throw new IllegalArgumentException("no engine for UND (bootstrap first)");
+        }
+        return ensure(type);
     }
 
     public synchronized boolean isResident(AsrLanguage lang) {
-        return resident.containsKey(lang);
+        return lang != null && resident.containsKey(AsrModelType.of(lang));
     }
 
-    /** Drop everything except active + candidate under memory pressure. */
+    public synchronized boolean isResident(AsrModelType type) {
+        return type != null && resident.containsKey(type);
+    }
+
+    /** Drop everything except active + candidate buckets under memory pressure. */
     public synchronized void trimTo(AsrLanguage active, AsrLanguage candidate) {
-        for (AsrLanguage l : new AsrLanguage[]{AsrLanguage.VI, AsrLanguage.EN, AsrLanguage.ZH}) {
-            if (l != active && l != candidate && resident.containsKey(l)) {
+        trimTo(AsrModelType.of(active), AsrModelType.of(candidate));
+    }
+
+    /** Drop everything except active + candidate buckets under memory pressure. */
+    public synchronized void trimTo(AsrModelType active, AsrModelType candidate) {
+        for (AsrModelType t : new AsrModelType[]{AsrModelType.VI, AsrModelType.EN_ZH}) {
+            if (t != active && t != candidate && resident.containsKey(t)) {
                 try {
-                    resident.get(l).close();
+                    resident.get(t).close();
                 } catch (Exception ignored) {
                 }
-                resident.remove(l);
-                Log.i(TAG, "trimmed " + l + " under memory pressure");
+                resident.remove(t);
+                Log.i(TAG, "trimmed " + t.code + " under memory pressure");
             }
         }
     }
@@ -133,41 +161,44 @@ public class ZipformerModelManager {
 
     // --- Internals ---------------------------------------------------
 
-    private StreamingAsrEngine ensure(AsrLanguage lang) {
-        StreamingAsrEngine e = resident.get(lang);
+    private StreamingAsrEngine ensure(AsrModelType type) {
+        StreamingAsrEngine e = resident.get(type);
         if (e != null) return e;
+        // The bucket's canonical label is what the engine is constructed with
+        // (EN_ZH → EN). language() is informational only; identity is the
+        // bucket, so EN and ZH can never allocate two sessions again.
+        AsrLanguage lang = AsrLanguage.canonicalOf(type);
         try {
             e = factory.create(lang);
-            resident.put(lang, e);
+            resident.put(type, e);
             return e;
         } catch (Exception ex) {
-            Log.e(TAG, "engine create failed for " + lang, ex);
+            Log.e(TAG, "engine create failed for " + type.code, ex);
             StreamingAsrEngine fake = new StreamingAsrEngine.FakeEngine(lang);
-            resident.put(lang, fake);
+            resident.put(type, fake);
             return fake;
         }
     }
 
-    private Assets assetsFor(AsrLanguage lang) {
-        Assets a = assets.get(lang);
+    private Assets assetsFor(AsrModelType type) {
+        Assets a = assets.get(type);
         if (a != null) return a;
-        switch (lang) {
+        AsrLanguage lang = AsrLanguage.canonicalOf(type);
+        switch (type) {
             case VI:
                 a = resolve(lang, AsrState.VI_ENCODER, AsrState.VI_DECODER,
                         AsrState.VI_JOINER, AsrState.VI_TOKENS);
                 break;
-            case EN:
-            case ZH:
-                // EN and ZH share one bilingual model; each keeps its own
-                // engine slot so router state stays per-language.
-                a = resolve(lang, AsrState.MIXED_ENCODER, AsrState.MIXED_DECODER,
-                        AsrState.MIXED_JOINER, AsrState.MIXED_TOKENS);
+            case EN_ZH:
+                // ONE bilingual model serves both labels (mixed EN/ZH plan).
+                a = resolve(lang, AsrState.EN_ZH_ENCODER, AsrState.EN_ZH_DECODER,
+                        AsrState.EN_ZH_JOINER, AsrState.EN_ZH_TOKENS);
                 break;
             default:
                 a = new Assets(lang, null, null, null, null);
                 break;
         }
-        assets.put(lang, a);
+        assets.put(type, a);
         return a;
     }
 

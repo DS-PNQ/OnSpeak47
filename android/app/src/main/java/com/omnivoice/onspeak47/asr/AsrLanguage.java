@@ -28,4 +28,19 @@ public enum AsrLanguage {
             default: return UND;
         }
     }
+
+    /**
+     * Model bucket that decodes this language (mixed EN/ZH plan): EN and ZH
+     * share one bilingual model, so both map to {@link AsrModelType#EN_ZH}.
+     * Routing decisions, rollback and the resident model pool all key on this
+     * — the language label is only used for display and LID math.
+     */
+    public AsrModelType modelType() {
+        return AsrModelType.of(this);
+    }
+
+    /** Canonical language label for a model bucket (for engine construction). */
+    public static AsrLanguage canonicalOf(AsrModelType type) {
+        return type == null ? UND : type.canonical;
+    }
 }

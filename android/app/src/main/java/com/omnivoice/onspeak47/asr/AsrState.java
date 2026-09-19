@@ -219,19 +219,21 @@ public final class AsrState {
      * EN + ZH share ONE bilingual model: k2fsa-zipformer-chinese-english-mixed
      * (csukuangfj). It replaces the previous separate EN (2023-06-26, 70 MB)
      * and ZH (int8 2025-06-30, 161 MB) exports: one 80 MB encoder covers both
-     * languages instead of two sessions and 231 MB of assets, and code-switched
-     * speech no longer needs a model switch. Both language SLOTS still exist in
-     * the router, so each keeps its own native session/stream state; they just
-     * load the same files. `model_type` for these assets is "zipformer" (v1) —
-     * see transducerModelType().
+     * languages instead of 231 MB of assets, and code-switched speech is
+     * handled inside the model by its shared BPE vocabulary.
+     *
+     * ONE session serves both labels: {@link AsrModelType#EN_ZH} is the pool
+     * key, so a LID flip between en and zh neither loads a model nor restarts
+     * a stream (mixed EN/ZH plan §4). `model_type` for these assets is
+     * "zipformer" (v1) — see transducerModelType().
      *
      * The int8 encoder/joiner + fp32 decoder split mirrors the upstream export
      * (no int8 decoder is published) — the asset names reflect the real files.
      */
-    public static final String MIXED_ENCODER = "zipformer_mixed_encoder.int8.onnx";
-    public static final String MIXED_DECODER = "zipformer_mixed_decoder.onnx";
-    public static final String MIXED_JOINER = "zipformer_mixed_joiner.int8.onnx";
-    public static final String MIXED_TOKENS = "zipformer_mixed_tokens.txt";
+    public static final String EN_ZH_ENCODER = "zipformer_en_zh_mixed_encoder.int8.onnx";
+    public static final String EN_ZH_DECODER = "zipformer_en_zh_mixed_decoder.onnx";
+    public static final String EN_ZH_JOINER = "zipformer_en_zh_mixed_joiner.int8.onnx";
+    public static final String EN_ZH_TOKENS = "zipformer_en_zh_mixed_tokens.txt";
     public static final String VAD_MODEL = "silero_vad.onnx";
 
     // --- VoxLingua107 ECAPA acoustic LID (VoxLingua pipeline §11–§13) ---

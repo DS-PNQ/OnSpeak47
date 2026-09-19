@@ -192,6 +192,17 @@ public class LanguageRouter {
             state = RouterState.ACTIVE;
             return Decision.HOLD;
         }
+        // --- Mixed EN/ZH plan §4: EN and ZH share ONE bilingual model, so a
+        // LID flip between the two labels is NOT a model switch. Guarding on
+        // the model type (not the language label) keeps this a two-way
+        // VI ↔ EN_ZH decision: code-switched audio whose acoustic scores
+        // oscillate between en and zh must not trigger a rollback window, a
+        // shadow decode, or an engine/stream reset.
+        if (AsrModelType.of(cand) == AsrModelType.of(active)) {
+            clearCandidate();
+            state = RouterState.ACTIVE;
+            return Decision.HOLD;
+        }
         if (lid.confidence < switchThreshold) {
             clearCandidate();
             if (state == RouterState.CANDIDATE_SWITCH) state = RouterState.ACTIVE;
@@ -274,6 +285,13 @@ public class LanguageRouter {
         }
         Float activeScore = scores.get(active);
         float activeScoreV = activeScore == null ? 0 : activeScore;
+        // Mixed EN/ZH plan §4: a label flip inside the shared bilingual model
+        // (en ↔ zh) is not a boundary switch — there is no other model to
+        // move to, and re-pointing would restart the stream for nothing.
+        if (best != active && AsrModelType.of(best) == AsrModelType.of(active)) {
+            clearCandidate();
+            return false;
+        }
         if (best != active && bestScore >= AsrState.ENDPOINT_THRESHOLD
                 && bestScore > activeScoreV + AsrState.ENDPOINT_MARGIN) {
             active = best;

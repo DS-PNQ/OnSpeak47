@@ -116,6 +116,28 @@ public final class LanguageScores {
         return AsrLanguage.ZH;
     }
 
+    /**
+     * EN+ZH as ONE bucket (mixed EN/ZH plan §2). EN and ZH are decoded by the
+     * same bilingual model, so routing comparisons must be VI vs non-VI —
+     * comparing en against zh directly would ask the router to switch between
+     * two labels that share a model.
+     */
+    public float getNonViScore() {
+        return Math.max(en, zh);
+    }
+
+    /**
+     * Model bucket the top supported language belongs to. Deterministic on
+     * ties (vi-first, matching {@link #topSupported()}); these are
+     * renormalized supported-relative posteriors, so the "no winner" case of
+     * the plan's pseudo-code cannot occur — VI is the tie-break instead of an
+     * unusable UND that would stall routing.
+     */
+    public AsrModelType getTopModelType() {
+        if (vi >= getNonViScore()) return AsrModelType.VI;
+        return AsrModelType.EN_ZH;
+    }
+
     /** Top supported probability. */
     public float topSupportedScore() {
         switch (topSupported()) {

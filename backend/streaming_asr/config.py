@@ -106,10 +106,13 @@ LATENCY_P95_TARGET_MS = 500
 
 # EN + ZH share ONE bilingual export: k2fsa-zipformer-chinese-english-mixed
 # (csukuangfj) — replaces the separate EN 2023-06-26 and ZH int8 2025-06-30
-# packages. Both language slots still exist in the router; they just load the
-# same files (mirrors AsrState.MIXED_*).
-MIXED_FILES = ("zipformer_mixed_encoder.int8.onnx", "zipformer_mixed_decoder.onnx",
-               "zipformer_mixed_joiner.int8.onnx", "zipformer_mixed_tokens.txt")
+# packages. ONE model serves both labels: AsrModelType.EN_ZH is the pool key,
+# so a label flip between en and zh never loads a model or restarts a stream
+# (mirrors AsrState.EN_ZH_*).
+MIXED_FILES = ("zipformer_en_zh_mixed_encoder.int8.onnx",
+               "zipformer_en_zh_mixed_decoder.onnx",
+               "zipformer_en_zh_mixed_joiner.int8.onnx",
+               "zipformer_en_zh_mixed_tokens.txt")
 MODEL_FILES = {
     "vi": ("zipformer_vi_encoder.onnx", "zipformer_vi_decoder.onnx",
             "zipformer_vi_joiner.onnx", "zipformer_vi_tokens.txt"),

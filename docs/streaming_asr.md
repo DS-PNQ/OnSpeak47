@@ -152,7 +152,7 @@ python optimize/11_fetch_streaming_zipformer.py --all --stage-assets
 | Lang | Asset set | Notes |
 |---|---|---|
 | VI | `hynt/Zipformer-30M-RNNT-Streaming-6000h` (HF) → `zipformer_vi_*` | streaming 30M, chunk 16/32/64; `model_type=zipformer2` |
-| EN + ZH | `csukuangfj/k2fsa-zipformer-chinese-english-mixed` (HF) → `zipformer_mixed_*` | **one bilingual model for both slots**; INT8 encoder ~80 MB (fp32 decoder), `model_type=zipformer` (v1) — see below |
+| EN + ZH | `csukuangfj/k2fsa-zipformer-chinese-english-mixed` (HF) → `zipformer_en_zh_mixed_*` | **one bilingual model, one session for both labels** (`AsrModelType.EN_ZH`); INT8 encoder ~80 MB (fp32 decoder), `model_type=zipformer` (v1) — see below |
 | VAD | `silero_vad.onnx` (release asset) | missing → energy-gate fallback |
 
 `model_type` is **per asset set, never global** (`AsrState.transducerModelType`):
@@ -160,11 +160,15 @@ the VI export is zipformer v2 (`query_head_dims` present) while the mixed export
 is zipformer v1 (`attention_dims` only). Decoding the mixed model with
 `"zipformer2"` **aborts the process natively** — there is no Java exception to
 catch (verified 2026-09-18 with sherpa-onnx Python from a clean process).
-The EN and ZH router slots stay separate; they just resolve to the same files.
+The EN and ZH router slots stay separate *as labels*, but they resolve to the
+same files AND to the same session: the pool is keyed by `AsrModelType`
+(`VI`, `EN_ZH`), so a LID flip between `en` and `zh` is not a model switch —
+it produces no rollback, no shadow decode and no stream reset (the shared BPE
+vocabulary handles code switching inside the model).
 
-RAM buckets (§5): ≥8 GB preload VI+EN+ZH; 6 GB VI+EN (+ZH lazy);
-≤4 GB VI (+EN/ZH lazy). One active decoder; candidate only in the rollback
-window; `trimTo(active, candidate)` under pressure (never 3 parallel).
+RAM buckets (§5): ≥6 GB preload VI + EN_ZH (two sessions); <6 GB VI resident
+with EN_ZH lazy. One active decoder; candidate only in the rollback window;
+`trimTo(active, candidate)` under pressure (never 3 parallel).
 
 ## Enablement (device validation order)
 

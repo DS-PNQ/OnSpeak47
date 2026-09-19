@@ -81,8 +81,6 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     /** utteranceSpeechMs at the last dual-candidate run (decode-storm gate:
      *  a candidate pass costs 2 decodes — rerun at most every 800 ms). */
     private volatile long lastCandidateRunSpeechMs = -1;
-    /** Last speculative pair tried (rotation covers the 3rd language). */
-    private volatile AsrLanguage[] lastCandidatePair = null;
     /**
      * Confidence of the decision that activated the current language. While
      * it stays below BOOTSTRAP_THRESHOLD the acoustic referee keeps running
@@ -134,7 +132,9 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
      *  on the worker: the audio thread resolves it). */
     private volatile AsrLanguage pendingProvisionalLang = null;
     /** Top language of the previous uncertain result (switch needs 2 hops). */
-    private volatile AsrLanguage lastUncertainTop = null;
+    /** Bucket of the last uncertain LID top (mixed EN/ZH plan: EN and ZH are
+     *  one bucket, so an en↔zh flip is not a change of evidence). */
+    private volatile AsrModelType lastUncertainType = null;
     /** Last provisional text already posted to UI (dedup: the transducer
      *  re-emits the same hypothesis every 160 ms — re-posting it only
      *  churns the UI without new information). The decode itself still
@@ -250,7 +250,6 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         lastRefereeSpeechMs = -1;
         lastBootstrapResult = null;
         lastCandidateRunSpeechMs = -1;
-        lastCandidatePair = null;
         bootstrapPending = false;
         utteranceSeq.incrementAndGet();
         resetProvisional();
@@ -546,16 +545,20 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
             }
         }
         if (top == null) return;
-        boolean persistent = (top == lastUncertainTop);
-        lastUncertainTop = top;
-        if (top == provisionalLang) {
+        // Bucket-aware (mixed EN/ZH plan §4): en↔zh is not a change of
+        // evidence — the two labels share ONE model, so following the flip
+        // would reset the live provisional stream for nothing.
+        AsrModelType topType = AsrModelType.of(top);
+        boolean persistent = (topType == lastUncertainType);
+        lastUncertainType = topType;
+        if (provisionalLang != null && AsrModelType.of(provisionalLang) == topType) {
             provisionalQuiet = false;
             return;
         }
         if (topScore < AsrState.PROVISIONAL_MIN_SUPPORTED_REL || !persistent) {
             return;
         }
-        if (models.isResident(top)) {
+        if (models.isResident(topType)) {
             pendingProvisionalLang = top;
             provisionalQuiet = false;
         } else {
@@ -576,9 +579,20 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
                 || activeLang != AsrLanguage.UND) {
             return;
         }
+        // Same model bucket ⇒ same engine instance, so re-pointing would reset
+        // the live speculative stream without changing what decodes it.
+        if (provisionalLang != null
+                && AsrModelType.of(pending) == AsrModelType.of(provisionalLang)) {
+            pendingProvisionalLang = null;
+            return;
+        }
         pendingProvisionalLang = null;
         synchronized (this) {
             if (pending == provisionalLang || activeLang != AsrLanguage.UND) return;
+            if (provisionalLang != null
+                    && AsrModelType.of(pending) == AsrModelType.of(provisionalLang)) {
+                return;
+            }
             try {
                 StreamingAsrEngine eng = models.get(pending);
                 synchronized (engineLock) {
@@ -931,42 +945,34 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
     }
 
     /**
-     * Rotating candidate pair (≤2 decodes per pass, §10): normally the
-     * acoustic top-2; when the previous pass was inconclusive, the leftover
-     * 3rd language pairs with the top-1 so all three get tried within ~1.6 s
-     * without ever running 3 models at once.
+     * Candidate pair (≤2 decodes per pass, §10) — bucket-based per the mixed
+     * EN/ZH plan §5.1: only TWO models exist, so every pass covers BOTH
+     * buckets (VI and EN_ZH), ordered by acoustic score. The EN_ZH entry is
+     * whichever label (en or zh) the acoustic scores rank higher, so telemetry
+     * and the committed transcript still name the heard language.
+     *
+     * The old rotation is gone and cannot be reintroduced: it existed to reach
+     * a third language, and because EN and ZH shared a model it could spend
+     * both decodes on [EN, ZH] — two labels of the SAME model — leaving VI
+     * untested for that pass.
      */
     private AsrLanguage[] chooseCandidatePair(Map<AsrLanguage, Float> scores) {
-        AsrLanguage[] top = topTwo(scores);
-        if (top[0] == null) return top; // defensive: topTwo never returns nulls
-        AsrLanguage[] last = lastCandidatePair;
-        if (last == null) return top;
-        AsrLanguage leftover = null;
-        for (AsrLanguage l : new AsrLanguage[]{AsrLanguage.VI, AsrLanguage.EN, AsrLanguage.ZH}) {
-            if (l != last[0] && l != last[1]) {
-                leftover = l;
-                break;
-            }
-        }
-        if (leftover == null || leftover == top[0]) return top;
-        return new AsrLanguage[]{top[0], leftover};
+        float vi = scoreOf(scores, AsrLanguage.VI);
+        float en = scoreOf(scores, AsrLanguage.EN);
+        float zh = scoreOf(scores, AsrLanguage.ZH);
+        AsrLanguage enZhRep = en >= zh ? AsrLanguage.EN : AsrLanguage.ZH;
+        float enZh = Math.max(en, zh);
+        // Both entries are always tried, so the order only decides which
+        // decode lands first — an empty/null map cannot "pick a language".
+        return vi >= enZh
+                ? new AsrLanguage[]{AsrLanguage.VI, enZhRep}
+                : new AsrLanguage[]{enZhRep, AsrLanguage.VI};
     }
 
-    /** Languages tried by neither member of {@code pair} (0–1 entries). */
-    private static AsrLanguage[] leftoversOf(AsrLanguage[] pair) {
-        java.util.List<AsrLanguage> out = new java.util.ArrayList<>();
-        if (pair != null) {
-            for (AsrLanguage l : new AsrLanguage[]{AsrLanguage.VI, AsrLanguage.EN, AsrLanguage.ZH}) {
-                if (l != pair[0] && l != pair[1]) out.add(l);
-            }
-        }
-        return out.toArray(new AsrLanguage[0]);
-    }
-
-    /** One-shot decode of {@code window} on at most the top-2 models. */
-    private void runSpeculativeCandidatesOn(LanguageIdEngine.LidResult r, long uid,
-                                            float[] window) {
-        runSpeculativeCandidatesOn(r, uid, window, topTwo(r == null ? null : r.scores));
+    private static float scoreOf(Map<AsrLanguage, Float> scores, AsrLanguage lang) {
+        if (scores == null) return 0f;
+        Float v = scores.get(lang);
+        return v == null ? 0f : v;
     }
 
     /** One-shot decode of {@code window} on the given pair (max 2). */
@@ -978,7 +984,6 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
                 if (activeLang != AsrLanguage.UND) return;
             }
             if (window == null || window.length == 0) return;
-            lastCandidatePair = pair;
             AsrLanguage winner = null;
             float winnerScore = -1;
             float secondScore = -1;
@@ -1020,40 +1025,6 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         } finally {
             bootstrapPending = false;
         }
-    }
-
-    /** Top-2 languages from a bootstrap score map (UND excluded).
-     *
-     * 2026-09-16 §6.3: pure score order with a fixed scan order that does NOT
-     * lead with VI ([EN, ZH, VI]) — the old [VI, EN, ZH] scan returned
-     * [VI, EN] on every flat/uncertain map, and with the 0.30 bar the
-     * fallback commit was almost always Vietnamese. Rotation
-     * ({@link #chooseCandidatePair}) still covers the third language on the
-     * next pass. Mirrors the Python reference exactly (stable sort over
-     * [en, zh, vi]).
-     */
-    private static AsrLanguage[] topTwo(Map<AsrLanguage, Float> scores) {
-        // No ranking at all (null map): same non-VI-first default as a flat
-        // map below — never a VI-first guess.
-        if (scores == null) return new AsrLanguage[]{AsrLanguage.EN, AsrLanguage.ZH};
-        AsrLanguage first = null;
-        AsrLanguage second = null;
-        float s1 = Float.NEGATIVE_INFINITY;
-        float s2 = Float.NEGATIVE_INFINITY;
-        for (AsrLanguage l : new AsrLanguage[]{AsrLanguage.EN, AsrLanguage.ZH, AsrLanguage.VI}) {
-            Float v = scores.get(l);
-            float f = v == null ? 0f : v;
-            if (f > s1) {
-                s2 = s1;
-                second = first;
-                s1 = f;
-                first = l;
-            } else if (f > s2) {
-                s2 = f;
-                second = l;
-            }
-        }
-        return new AsrLanguage[]{first, second};
     }
 
     private static class CandidateScore {
@@ -1358,23 +1329,15 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
                 activateBootstrap(decided, r.confidence, uid);
                 decided = activeLang;
             } else {
-                // Second chance over the utterance audio itself: the top pair,
-                // then the leftover language if still undecided.
+                // Second chance over the utterance audio itself. ONE pass is
+                // enough now: the candidate pair always covers BOTH model
+                // buckets (VI + EN_ZH), so there is no third language left to
+                // rotate in on a later pass.
                 AsrLanguage[] pair = chooseCandidatePair(
                         r == null ? null : r.scores);
-                // Defensive null guard (topTwo never returns nulls — flat maps
-                // fall back to [EN, ZH] with VI covered by the leftover pass).
                 if (pair[0] != null) {
                     runSpeculativeCandidatesOn(r, uid, spoken, pair);
                     decided = activeLang;
-                    if (decided == AsrLanguage.UND) {
-                        AsrLanguage[] rest = leftoversOf(pair);
-                        if (rest.length > 0) {
-                            runSpeculativeCandidatesOn(r, uid, spoken,
-                                    new AsrLanguage[]{rest[0], AsrLanguage.UND});
-                            decided = activeLang;
-                        }
-                    }
                 }
             }
             if (decided == AsrLanguage.UND) {
@@ -1447,7 +1410,6 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         lastRefereeSpeechMs = -1;
         lastBootstrapResult = null;
         lastCandidateRunSpeechMs = -1;
-        lastCandidatePair = null;
         bootstrapPending = false;
         resetProvisional();
         utteranceSeq.incrementAndGet(); // invalidate in-flight LID results
@@ -1468,7 +1430,7 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         provisionalQuiet = false;
         provisionalComplete = true;
         pendingProvisionalLang = null;
-        lastUncertainTop = null;
+        lastUncertainType = null;
         try {
             provisionalAsr = models.get(AsrLanguage.VI);
             synchronized (engineLock) {
@@ -1524,7 +1486,11 @@ public class StreamingPipeline implements AudioCapture.FrameListener {
         String bestText = "";
         float bestConf = 0;
         for (AsrLanguage lang : new AsrLanguage[]{AsrLanguage.VI, AsrLanguage.EN, AsrLanguage.ZH}) {
-            if (lang == baseLang) continue;
+            // Floor at the MODEL level (mixed EN/ZH plan §5.2): a label flip
+            // inside the shared bilingual model (baseLang EN, candidate ZH) is
+            // not a second opinion — it would re-decode the same engine over
+            // the same audio and could "switch" the label for no reason.
+            if (AsrModelType.of(lang) == AsrModelType.of(baseLang)) continue;
             EndpointVerdict cand = scoreCandidate(lang, audio);
             if (cand == null || cand.text.isEmpty()) continue;
             float lexCand = LanguageIdEngine.lexicalFit(cand.text, lang);

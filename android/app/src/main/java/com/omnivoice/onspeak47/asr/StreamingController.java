@@ -32,8 +32,8 @@ public class StreamingController {
     public static boolean isAvailable(Context context) {
         // Check extraction dir first (fast path after first launch), then APK assets.
         String[] probes = {
-                AsrState.VI_ENCODER, AsrState.MIXED_ENCODER,
-                AsrState.VI_TOKENS, AsrState.MIXED_TOKENS,
+                AsrState.VI_ENCODER, AsrState.EN_ZH_ENCODER,
+                AsrState.VI_TOKENS, AsrState.EN_ZH_TOKENS,
         };
         for (String asset : probes) {
             File extracted = new File(context.getFilesDir(), asset);
